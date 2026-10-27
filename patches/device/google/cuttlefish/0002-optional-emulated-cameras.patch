@@ -1,0 +1,19 @@
+mothershipOS: the emulated cameras are optional (TARGET_CF_NO_EMULATED_CAMERA := true leaves them out), for a
+product whose cameras are real ones through the external camera HAL (mship.camera).
+
+diff -ruN a/shared/phone/device_vendor.mk b/shared/phone/device_vendor.mk
+--- a/shared/phone/device_vendor.mk	2026-10-27 02:22:56.568019501 +0000
++++ b/shared/phone/device_vendor.mk	2026-10-27 02:22:56.595020210 +0000
+@@ -41,8 +41,12 @@
+ $(call inherit-product, device/google/cuttlefish/shared/device.mk)
+ 
+ # Loads the camera HAL and which set of cameras is required.
++# mothershipOS: a product with real cameras (the external camera HAL on V4L2 devices) sets
++# TARGET_CF_NO_EMULATED_CAMERA := true and gets none of the emulated ones.
++ifneq ($(TARGET_CF_NO_EMULATED_CAMERA),true)
+ $(call inherit-product, device/google/cuttlefish/shared/camera/device_vendor.mk)
+ $(call inherit-product, device/google/cuttlefish/shared/camera/config/standard.mk)
++endif
+ 
+ # Support mixing CF system onto previous versions of vendor
+ PRODUCT_EXTRA_VNDK_VERSIONS := 31 32 33 34

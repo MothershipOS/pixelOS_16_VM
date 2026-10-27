@@ -1,0 +1,11 @@
+[package]
+name = "pixelos-install"
+description = "The PixelOS VM's install step on the phone (mothershipOS runs it): the disk from the package's images, or an update that keeps the user's data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+android-image.workspace = true

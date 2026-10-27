@@ -1,0 +1,11 @@
+diff --git a/shared/config/fstab.in b/shared/config/fstab.in
+index a995e3280..6e0c361bf 100644
+--- a/shared/config/fstab.in
++++ b/shared/config/fstab.in
+@@ -30,4 +30,6 @@ system_dlkm /system_dlkm ext4 noatime,ro,errors=panic wait,logical,first_stage_m
+ /dev/block/zram0 none swap defaults zramsize=75%
+ /dev/block/vdc1 /sdcard vfat defaults recoveryonly
+ /devices/*/block/vdc auto auto defaults voldmanaged=sdcard1:auto,encryptable=userdata
++# mothershipOS (mship.usb): USB disks attached to the virtual xHCI controller
++/devices/*/usb[0-9]* auto auto defaults voldmanaged=usb:auto
+ shared /mnt/vendor/shared virtiofs nosuid,nodev,noatime nofail

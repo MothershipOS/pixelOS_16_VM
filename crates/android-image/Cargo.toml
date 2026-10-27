@@ -1,0 +1,11 @@
+[package]
+name = "android-image"
+description = "Android image formats for the PixelOS VM: sparse images, GPT, boot/vendor_boot v4, bootconfig, LZ4 legacy ramdisks, newc cpio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode"] }
+crc32fast = "1"

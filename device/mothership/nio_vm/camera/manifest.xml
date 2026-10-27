@@ -1,0 +1,8 @@
+<!-- mothershipOS: the external camera provider (the phone's cameras, mship.camera) -->
+<manifest version="1.0" type="device">
+    <hal format="aidl">
+        <name>android.hardware.camera.provider</name>
+        <version>1</version>
+        <fqname>ICameraProvider/external/0</fqname>
+    </hal>
+</manifest>

@@ -1,0 +1,5 @@
+{
+  "id": "pixelos",
+  "keep": ["disk.img"],
+  "install": "pixelos-install"
+}

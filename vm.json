@@ -1,0 +1,83 @@
+{
+  "schema": 1,
+  "name": "PixelOS (Android 16)",
+  "min_mothership": "2026.1",
+  "platform": {
+    "id": "cuttlefish-arm64",
+    "version": "1.0"
+  },
+  "boot": {
+    "kernel": "pkg/Image",
+    "initrd": "pkg/initrd-crosvm.img",
+    "cmdline": "pkg/cmdline.crosvm",
+    "disk": "disk.img"
+  },
+  "slots": {
+    "display": {
+      "contract": "mship.display",
+      "version": "1.0"
+    },
+    "power": {
+      "contract": "mship.display-power",
+      "version": "1.0",
+      "required": false
+    },
+    "touch": {
+      "contract": "mship.touch",
+      "version": "1.0"
+    },
+    "keys": {
+      "contract": "mship.keys",
+      "version": "1.0"
+    },
+    "gpu": {
+      "contract": "mship.gpu",
+      "version": "1.0",
+      "params": {
+        "context_types": [
+          "drm",
+          "cross-domain"
+        ]
+      }
+    },
+    "internet": {
+      "contract": "mship.net-shared",
+      "version": "1.0",
+      "required": false
+    },
+    "bt": {
+      "contract": "mship.bt",
+      "version": "1.0",
+      "required": false
+    },
+    "battery": {
+      "contract": "mship.battery",
+      "version": "1.0",
+      "required": false
+    },
+    "usb": {
+      "contract": "mship.usb",
+      "version": "1.0",
+      "required": false
+    },
+    "modem": {
+      "contract": "mship.modem",
+      "version": "1.0",
+      "required": false
+    },
+    "camera": {
+      "contract": "mship.camera",
+      "version": "1.0",
+      "required": false
+    }
+  },
+  "handover": {
+    "when_shown": [
+      "display",
+      "buttons"
+    ],
+    "while_running": [
+      "internet"
+    ]
+  }
+}

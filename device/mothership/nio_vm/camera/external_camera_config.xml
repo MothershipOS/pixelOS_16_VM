@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- mothershipOS: the phone's cameras (mship.camera), V4L2 capture devices from the host through virtio-media.
+     Every /dev/video* with video capture is one; the video decoder (an M2M device) is skipped by the HAL itself. -->
+<ExternalCamera>
+    <Provider>
+        <!-- must exist, even empty: without it the HAL stops reading here and keeps its default limits (720p at
+             7.5 fps, which drops every 30 fps camera) -->
+        <ignore/>
+    </Provider>
+    <Device>
+        <MaxJpegBufferSize bytes="3145728"/>
+        <NumVideoBuffers count="4"/>
+        <NumStillBuffers count="2"/>
+        <!-- one value for every camera: the rear sensors' mounting (the front ones differ: a gap) -->
+        <Orientation degree="90"/>
+        <FpsList>
+            <Limit width="1280" height="720" fpsBound="30.0"/>
+            <Limit width="1920" height="1080" fpsBound="30.0"/>
+        </FpsList>
+    </Device>
+</ExternalCamera>

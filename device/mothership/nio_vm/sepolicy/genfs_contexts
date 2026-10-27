@@ -1,0 +1,3 @@
+# goldfish battery (mship.battery): crosvm's arm64 device tree places it at 0x20e9000 with the cuttlefish-arm64
+# device set; the health HAL reads it as battery info
+genfscon sysfs /devices/platform/20e9000.goldfish_battery/power_supply u:object_r:sysfs_batteryinfo:s0

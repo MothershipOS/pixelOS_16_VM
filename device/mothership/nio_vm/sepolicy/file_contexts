@@ -1,0 +1,7 @@
+# Mesa freedreno/turnip (virtio-gpu native context): loaded into every app process
+/vendor/lib(64)?/libEGL_mesa\.so          u:object_r:same_process_hal_file:s0
+/vendor/lib(64)?/libGLESv1_CM_mesa\.so    u:object_r:same_process_hal_file:s0
+/vendor/lib(64)?/libGLESv2_mesa\.so       u:object_r:same_process_hal_file:s0
+/vendor/lib(64)?/libgallium_dri\.so       u:object_r:same_process_hal_file:s0
+/vendor/lib(64)?/hw/vulkan\.freedreno\.so u:object_r:same_process_hal_file:s0
+/vendor/lib(64)?/hw/gralloc\.minigbm\.so    u:object_r:same_process_hal_file:s0

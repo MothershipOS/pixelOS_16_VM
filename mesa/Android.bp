@@ -1,0 +1,24 @@
+// Mesa freedreno (GLES) + turnip (Vulkan) for virtio-gpu DRM native context (msm): the guest drives the
+// host Adreno through virtio-gpu with its own Mesa. Prebuilt with the NDK (see VERSION, pixelos/mesa/build.sh).
+package { default_applicable_licenses: [] }
+
+cc_defaults {
+    name: "mship_mesa_defaults",
+    vendor: true,
+    compile_multilib: "both",
+    check_elf_files: false,
+    strip: { none: true },
+    // declared so Soong installs the vendor variants for both arches (the sphal namespace that loads EGL drivers
+    // resolves libhardware from /vendor/lib*, and nothing else 32-bit on vendor pulls it in)
+    shared_libs: ["libcutils", "libhardware", "liblog", "libnativewindow", "libsync", "libz"],
+}
+cc_prebuilt_library_shared { name: "libEGL_mesa", defaults: ["mship_mesa_defaults"], relative_install_path: "egl", arch: { arm64: { srcs: ["lib64/libEGL_mesa.so"] }, arm: { srcs: ["lib/libEGL_mesa.so"] } } }
+cc_prebuilt_library_shared { name: "libGLESv2_mesa", defaults: ["mship_mesa_defaults"], relative_install_path: "egl", arch: { arm64: { srcs: ["lib64/libGLESv2_mesa.so"] }, arm: { srcs: ["lib/libGLESv2_mesa.so"] } } }
+cc_prebuilt_library_shared { name: "libGLESv1_CM_mesa", defaults: ["mship_mesa_defaults"], relative_install_path: "egl", arch: { arm64: { srcs: ["lib64/libGLESv1_CM_mesa.so"] }, arm: { srcs: ["lib/libGLESv1_CM_mesa.so"] } } }
+cc_prebuilt_library_shared { name: "libgallium_dri", defaults: ["mship_mesa_defaults"], arch: { arm64: { srcs: ["lib64/libgallium_dri.so"] }, arm: { srcs: ["lib/libgallium_dri.so"] } } }
+cc_prebuilt_library_shared {
+    name: "vulkan.freedreno",
+    defaults: ["mship_mesa_defaults"],
+    relative_install_path: "hw",
+    arch: { arm64: { srcs: ["lib64/vulkan.freedreno.so"] }, arm: { srcs: ["lib/vulkan.freedreno.so"] } },
+}

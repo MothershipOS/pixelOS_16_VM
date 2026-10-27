@@ -1,0 +1,17 @@
+# meson cross file: NDK r27c, Android API 35, arm64. cargo xtask android-mesa mounts the NDK at /mb/ndk.
+[constants]
+ndk = '/mb/ndk/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/'
+[binaries]
+c = ndk + 'aarch64-linux-android35-clang'
+cpp = ndk + 'aarch64-linux-android35-clang++'
+ar = ndk + 'llvm-ar'
+strip = ndk + 'llvm-strip'
+pkg-config = '/usr/bin/false'
+[host_machine]
+system = 'android'
+cpu_family = 'aarch64'
+cpu = 'armv8'
+endian = 'little'
+[built-in options]
+# no libc++_shared on the device
+cpp_link_args = ['-static-libstdc++']
