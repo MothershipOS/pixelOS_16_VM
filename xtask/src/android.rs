@@ -304,13 +304,15 @@ pub fn initrd(pkg: &Path) -> Result<()> {
         println!("[android-initrd] {}", pkg.join(name).display());
     }
     // the kernel console on hvc0 (virtio, the launcher's kernel.log) at loglevel 5: fast, and it carries ranchu's
-    // display power lines the launcher turns into panel off/on; the emulated 8250 stays earlycon only
+    // display power lines the launcher turns into panel off/on; the emulated 8250 stays earlycon only.
+    // kpti=0: the GKI turns KPTI on for KASLR alone (the vCPUs report no E0PD); the phone's cores (Cortex-A77/A55)
+    // are not Meltdown-affected, and without it guest syscalls cost what they cost on the host (219 -> 173 ns)
     let cmdline = std::fs::read_to_string(pkg.join("cmdline"))?;
     let words: Vec<String> = cmdline
         .split_whitespace()
-        .filter(|w| !w.starts_with("loglevel="))
+        .filter(|w| !w.starts_with("loglevel=") && !w.starts_with("kpti="))
         .map(|w| if w == "console=ttyAMA0" || w == "console=ttyS0" { "console=hvc0".to_string() } else { w.to_string() })
-        .chain(["loglevel=5".to_string()])
+        .chain(["loglevel=5".to_string(), "kpti=0".to_string()])
         .collect();
     std::fs::write(pkg.join("cmdline.crosvm"), words.join(" ") + "\n")?;
     Ok(())
