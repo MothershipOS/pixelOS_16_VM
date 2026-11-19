@@ -22,17 +22,17 @@ the phone's hardware reaches it through mothershipOS's contracts as generic virt
 | `vm.json` | the VM manifest mothershipOS runs it from |
 | `Dockerfile.build` | the build container for its guest modules |
 | `docs/android-vm.md` | how it is built, packaged and run; status and gaps |
-
+| `docs/gki-modules.md` | building guest kernel modules for the stock GKI kernel |
 | `crates/pixelos-install` | its install step on the phone: the disk from the package's images, or an update that keeps the user's data |
 | `crates/android-image` | Android image formats (sparse, GPT, boot images, bootconfig, LZ4 ramdisks, cpio) |
 | `xtask/` | its build (`cargo xtask`) |
 
 ## Install (on the phone)
 PixelOS cannot be built on the phone (it needs the PixelOS tree on an x86 PC), so the phone installs the prebuilt
-package, a release asset of this repository:
+package from a [VM store](https://github.com/MothershipOS/vmstore) (its page shows the command) or a file:
 
 ```
-mship-system vm-install https://github.com/MothershipOS/pixelOS_16_VM/releases/latest/download/pixelOS_16_VM.tar.xz
+mship-system vm-install <store>/pixelos/package.tar.xz
 ```
 
 The first time it makes the VM's disk (32 GB of user data, `MSHIP_PIXELOS_USERDATA_GIB`); later it writes the new
@@ -41,7 +41,8 @@ system into the installed disk and keeps the user's data. How mothershipOS insta
 
 ## Build (on a PC)
 With the PixelOS tree (`device/mothership/nio_vm` from here, `cargo xtask android-patches <tree>`,
-`cargo xtask android-mesa <tree>`, then the build), in mothershipOS's build image (Rust with the phone's target,
+`cargo xtask android-mesa <tree>`, then the build; `cargo xtask release <pkg dir>` packs it, also as the VM's store
+folder `target/release-assets/store/pixelos`: the package, `store/info.txt` and `store/icon.svg`), in mothershipOS's build image (Rust with the phone's target,
 Docker), with mothershipOS checked out next to this repository (its guest drivers):
 
 ```

@@ -1,0 +1,6 @@
+name: PixelOS 16
+summary: Android 16 (PixelOS) with Google apps, GPU, camera, Wi-Fi, cellular and sound from the phone.
+
+Android 16 (PixelOS), built for mothershipOS. It runs with the phone's GPU (native context), camera, Wi-Fi,
+cellular data and sound, through mothershipOS's contracts: no phone drivers inside. Updating keeps your apps and
+data. Source: https://github.com/MothershipOS/pixelOS_16_VM

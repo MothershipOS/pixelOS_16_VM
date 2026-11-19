@@ -20,7 +20,8 @@ Cuttlefish `vsoc_arm64` virtual device, run under KVM by the mothershipOS host.
 - [x] battery from the host (goldfish battery fed by mship-battery, AOSP health HAL)
 - [~] cameras: the host's cameras as V4L2 devices via the external camera HAL (mship.camera): four cameras listed, capture not verified yet
 - [~] modem: rild talks AT to the phone's modem (mship.modem); SIM, registration and data need a SIM in
-- [ ] native Wi-Fi, audio, sensors, GNSS
+- [x] audio: the phone speaker (mship.audio), through the stock virtio-snd driver and audio HAL, no HAL changes
+- [ ] native Wi-Fi, sensors, GNSS
 - [ ] generic product name, guest perf tweaks (blur, region sampling)
 
 Details: `pixelOS_16_VM/docs/android-vm.md`.
