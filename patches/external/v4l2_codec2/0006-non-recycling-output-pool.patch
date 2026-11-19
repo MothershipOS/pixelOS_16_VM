@@ -1,0 +1,51 @@
+mothershipOS (mship.video): byte buffer output from a non-recycling pool. With the AIDL Codec2 HAL the byte buffer
+mode's GRALLOC pool is not bufferpool-backed: released blocks are freed, every fetch brings a new buffer. The frame
+pool dropped every new buffer id once it had seen as many as there are V4L2 buffers (an endless allocate/drop loop:
+decoding stalled after ~17 frames), and the decoder only knew fixed block -> V4L2 buffer pairs. Now such blocks are
+never dropped (the decoder only fetches while it has a free V4L2 buffer) and a new block takes any free DMABUF V4L2
+buffer (any fd at QBUF). Surface output (IGBA/BufferQueue) is unchanged.
+
+--- a/components/VideoFramePool.cpp
++++ b/components/VideoFramePool.cpp
+@@ -238,7 +238,12 @@
+         if (bufferId) {
+             ALOGV("%s(): Got buffer with id = %u", __func__, *bufferId);
+ 
+-            if (shouldDropBuffer(*bufferId)) {
++            // mothershipOS: a GRALLOC pool without bufferpool (AIDL Codec2 HAL, byte buffer mode) never hands the
++            // same buffer back: every block is new, none may be dropped (the decoder only fetches while it has a
++            // free V4L2 buffer, which bounds them)
++            const bool recycles = mBlockPool->getAllocatorId() != C2PlatformAllocatorStore::GRALLOC ||
++                                  _C2BlockFactory::GetGraphicBlockPoolData(*block) != nullptr;
++            if (recycles && shouldDropBuffer(*bufferId)) {
+                 // We drop buffer, since we got more then needed.
+                 ALOGV("%s(): Dropping allocated buffer with id = %u", __func__, *bufferId);
+                 bufferId = std::nullopt;
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -928,9 +928,22 @@
+         outputBuffer = mOutputQueue->getFreeBuffer(v4l2BufferId);
+         ALOG_ASSERT(v4l2BufferId == outputBuffer->bufferId());
+     } else {
+-        // If this happens, this is a bug in VideoFramePool. It should never
+-        // provide more blocks than we have V4L2 buffers.
+-        ALOGE("Got more different blocks than we have V4L2 buffers for.");
++        // mothershipOS: a pool that never hands a buffer back (GRALLOC without bufferpool: AIDL Codec2 HAL, byte
++        // buffer mode) brings a new block every time. DMABUF V4L2 buffers take any fd at QBUF: give it a free V4L2
++        // buffer and forget the block that buffer had.
++        outputBuffer = mOutputQueue->getFreeBuffer();
++        if (outputBuffer) {
++            const size_t v4l2BufferId = outputBuffer->bufferId();
++            for (auto it = mBlockIdToV4L2Id.begin(); it != mBlockIdToV4L2Id.end(); ++it) {
++                if (it->second == v4l2BufferId) {
++                    mBlockIdToV4L2Id.erase(it);
++                    break;
++                }
++            }
++            mBlockIdToV4L2Id.emplace(blockId, v4l2BufferId);
++        } else {
++            ALOGE("Got more different blocks than we have V4L2 buffers for.");
++        }
+     }
+ 
+     if (!outputBuffer) {

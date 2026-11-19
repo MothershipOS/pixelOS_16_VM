@@ -3,7 +3,10 @@
 //!
 //! - `gki-module <gki dir> <aosp dir> <driver>`: build mothershipOS's guest/drivers/<driver> as a module against the GKI tree
 //!   (`make O=out-vd M=... modules` in the Android build image, the toolchain from the AOSP prebuilts); the host
-//!   paths of the workspace and the AOSP tree (they are mounted into the container). target/gki/<driver>.ko
+//!   paths of the workspace and the AOSP tree (they are mounted into the container). target/gki/<driver>.ko. A driver
+//!   with an `upstream` file (a directory of the kernel tree, e.g. drivers/gpu/drm/virtio) is that in-tree driver:
+//!   its sources are copied from the GKI tree and the driver's `*.patch` applied; `*.symvers` in the driver are
+//!   passed as KBUILD_EXTRA_SYMBOLS (exports of vendor modules it uses)
 //! - `gki-symvers <out> <Image> <anchor.ko>...`: Module.symvers of a trimmed arm64 kernel Image, read from the
 //!   Image (its __ksymtab tables and CRC tables), the CRC tables found with modules known to load on it (anchors)
 //! - `gki-symvers-elf <out> <module>:<file>...`: Module.symvers entries from ELF files (__crc_<sym> symbols), e.g. the
@@ -28,12 +31,32 @@ pub fn module(gki: &str, aosp: &str, driver: &str) -> Result<PathBuf> {
     let stage = target_dir().join("gki").join(driver);
     let _ = std::fs::remove_dir_all(&stage);
     sync(&src, &stage)?;
+    // an in-tree driver: its sources from the GKI tree, then the patches
+    if let Ok(up) = std::fs::read_to_string(src.join("upstream")) {
+        let tree = Path::new(gki).join("common").join(up.trim());
+        for e in std::fs::read_dir(&tree).with_context(|| tree.display().to_string())?.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "c" || x == "h") {
+                std::fs::copy(&p, stage.join(e.file_name()))?;
+            }
+        }
+        let mut patches: Vec<PathBuf> = std::fs::read_dir(&src)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "patch")).collect();
+        patches.sort();
+        for p in patches {
+            let st = std::process::Command::new("patch").args(["-p1", "-d"]).arg(&stage).arg("-i").arg(&p).status()?;
+            ensure!(st.success(), "{}: does not apply to {}", p.display(), tree.display());
+        }
+    }
+    let extra: Vec<String> = std::fs::read_dir(&src)?.flatten().map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "symvers"))
+        .map(|p| format!("/driver/{}", p.file_name().unwrap().to_string_lossy())).collect();
+    let extra = format!("KBUILD_EXTRA_SYMBOLS={}", extra.join(" "));
     docker(&["build", "-q", "-t", IMAGE, "--build-arg", &format!("UID={}", unsafe { libc::getuid() }), &root().to_string_lossy(),
              "-f", &root().join("Dockerfile.build").to_string_lossy()])?;
     let path = "/gki/clang-r536225/bin:/aosp/prebuilts/rust/linux-x86/1.88.0/bin:/aosp/prebuilts/clang-tools/linux-x86/bin:/aosp/prebuilts/kernel-build-tools/linux-x86/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
     docker(&["run", "--rm", "-v", &format!("{gki}:/gki"), "-v", &format!("{aosp}:/aosp:ro"), "-v", &format!("{}:/driver", host_path(&stage)?),
              "-w", "/gki/common", "-e", &format!("PATH={path}"), IMAGE,
-             "make", "O=../out-vd", "ARCH=arm64", "LLVM=1", "M=/driver", "modules"])?;
+             "make", "O=../out-vd", "ARCH=arm64", "LLVM=1", "M=/driver", &extra, "modules"])?;
     let ko = std::fs::read_dir(&stage)?.flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "ko")).context("no module built")?;
     println!("{}", ko.display());
     Ok(ko)

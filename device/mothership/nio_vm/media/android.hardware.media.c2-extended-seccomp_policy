@@ -1,0 +1,15 @@
+# mship.video: syscalls the V4L2 Codec2 components (external/v4l2_codec2, libchrome) need beyond the default Codec2
+# policy (arm64 names of the list in v4l2_codec2's README): its device poll is interrupted through an eventfd
+eventfd2: 1
+epoll_create1: 1
+epoll_ctl: 1
+epoll_pwait: 1
+pselect6: 1
+getcwd: 1
+sysinfo: 1
+statfs: 1
+# byte buffer mode maps the decoded frames in this process (gralloc mapper, minigbm; dmabuf heaps check the
+# kernel version); minijail allows fcntl only while it logs filter failures (debuggable builds)
+fcntl: 1
+dup3: 1
+uname: 1

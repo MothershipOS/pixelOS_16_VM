@@ -1,0 +1,34 @@
+mothershipOS (mship.video): advertise only the profiles the decoder can output. Decoded frames are 8-bit 4:2:0
+(NV12); Venus (SM7250) offered VP9 profiles 0-3 and the framework derived HDR variants from them, so a client
+could pick this decoder for a 10-bit or 4:4:4 stream it cannot output, and fail instead of using another decoder.
+VP9 profiles 1-3 and HEVC Main 10 are left out.
+
+--- a/components/DecodeInterface.cpp
++++ b/components/DecodeInterface.cpp
+@@ -8,6 +8,7 @@
+ #include <v4l2_codec2/components/DecodeInterface.h>
+ 
+ #include <C2PlatformSupport.h>
++#include <algorithm>
+ #include <SimpleC2Interface.h>
+ #include <android/hardware/graphics/common/1.0/types.h>
+ #include <log/log.h>
+@@ -132,6 +133,18 @@
+         }
+     }
+ 
++    // mothershipOS: decoded frames are 8-bit 4:2:0 (NV12, the formats the decoder can output): leave out the profiles
++    // of other bit depths and chroma formats, so a client never picks this decoder for a stream it cannot output
++    // (VP9 profiles 1-3: 4:4:4 and 10-bit; HEVC Main 10)
++    profiles.erase(std::remove_if(profiles.begin(), profiles.end(),
++                                  [](uint32_t p) {
++                                      return p == C2Config::PROFILE_VP9_1 || p == C2Config::PROFILE_VP9_2 ||
++                                             p == C2Config::PROFILE_VP9_3 ||
++                                             p == C2Config::PROFILE_HEVC_MAIN_10 ||
++                                             p == C2Config::PROFILE_HEVC_MAIN_10_INTRA;
++                                  }),
++                   profiles.end());
++
+     // In case of no supported profile or uninitialized device maxSize is set to default
+     if (maxSize == ui::Size(1, 1)) maxSize = ui::Size(4096, 4096);
+ 

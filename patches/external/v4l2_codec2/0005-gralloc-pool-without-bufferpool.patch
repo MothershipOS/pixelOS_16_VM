@@ -1,0 +1,23 @@
+mothershipOS (mship.video): byte buffer output with the AIDL Codec2 HAL. In byte buffer mode the decoder fetches from
+the GRALLOC pool, which v4l2_codec2 expects to be bufferpool-backed (HIDL); with the AIDL HAL its blocks carry no
+pool data and getBufferIdFromGraphicBlock() dereferenced null (SIGSEGV). Such a block is identified by its DMABUF,
+as with BUFFERQUEUE/IGBA.
+
+--- a/components/VideoFramePool.cpp
++++ b/components/VideoFramePool.cpp
+@@ -52,6 +52,15 @@
+     case V4L2AllocatorId::SECURE_LINEAR: {
+         std::shared_ptr<_C2BlockPoolData> blockPoolData =
+                 _C2BlockFactory::GetGraphicBlockPoolData(block);
++        // mothershipOS: with the AIDL Codec2 HAL the GRALLOC pool is not bufferpool-backed (no pool data): a
++        // gralloc buffer is identified by its DMABUF, as with BUFFERQUEUE
++        if (!blockPoolData) {
++            auto dmabufId = android::getDmabufId(block.handle()->data[0]);
++            if (!dmabufId) {
++                return std::nullopt;
++            }
++            return dmabufId.value();
++        }
+         if (blockPoolData->getType() != _C2BlockPoolData::TYPE_BUFFERPOOL) {
+             ALOGE("Obtained C2GraphicBlock is not bufferpool-backed.");
+             return std::nullopt;

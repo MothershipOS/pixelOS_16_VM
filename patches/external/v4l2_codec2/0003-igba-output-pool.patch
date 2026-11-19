@@ -1,0 +1,18 @@
+mothershipOS (mship.video): output surfaces of the AIDL Codec2 HAL. With the AIDL HAL the client's surface feeds the
+decoder through an IGraphicBufferAllocator block pool (C2PlatformAllocatorStore::IGBA), not BufferQueue; its blocks
+are gralloc buffers like BufferQueue's, identified by their DMABUF. Before, decoding to a surface failed with
+"unknown allocator ID: 20".
+
+--- a/components/VideoFramePool.cpp
++++ b/components/VideoFramePool.cpp
+@@ -36,6 +36,10 @@
+     switch (blockPool.getAllocatorId()) {
+     case V4L2AllocatorId::SECURE_GRAPHIC:
+         FALLTHROUGH;
++    // mothershipOS: the AIDL Codec2 HAL feeds surfaces through IGraphicBufferAllocator, not BufferQueue: gralloc
++    // buffers all the same, identified by their DMABUF
++    case C2PlatformAllocatorStore::IGBA:
++        FALLTHROUGH;
+     case C2PlatformAllocatorStore::BUFFERQUEUE: {
+         auto dmabufId = android::getDmabufId(block.handle()->data[0]);
+         if (!dmabufId) {

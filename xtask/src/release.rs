@@ -1,5 +1,7 @@
 //! `release <pkg dir> [out dir]`: the VM's package for mothershipOS (`vm-install`), as one archive:
-//! target/release-assets/pixelOS_16_VM.tar.xz, to publish as a release asset of this repository.
+//! target/release-assets/pixelOS_16_VM.tar.xz, to publish as a release asset of this repository; and this VM's
+//! folder for a VM store (vmstore), target/release-assets/store/pixelos: the archive as package.tar.xz, info.txt and
+//! the icon (store/).
 //!
 //! It holds vm.json, mothership-package.json (id `pixelos`; `disk.img` kept on updates; the install step), the
 //! install step `pixelos-install` (built for the phone) and `pkg/`: the partition images and userdata (the disk is
@@ -40,7 +42,17 @@ pub fn release(pkg: &Path, out: Option<PathBuf>) -> Result<PathBuf> {
     let st = std::process::Command::new("tar").env("XZ_OPT", "-T0 -6").arg("-cJf").arg(&archive).arg("-C").arg(&stage).arg(".").status()?;
     ensure!(st.success(), "tar {}", archive.display());
     std::fs::remove_dir_all(&stage)?;
-    println!("{} ({} MB): publish it as a release asset; on the phone: mship-system vm-install <its URL>", archive.display(),
-             std::fs::metadata(&archive)?.len() >> 20);
+    let store = out.join("store/pixelos");
+    let _ = std::fs::remove_dir_all(&store);
+    std::fs::create_dir_all(&store)?;
+    for f in std::fs::read_dir(root().join("store"))? {
+        let f = f?;
+        std::fs::copy(f.path(), store.join(f.file_name()))?;
+    }
+    store_info(&store.join("info.txt"))?;
+    // a hard link, not a second copy of the archive
+    std::fs::hard_link(&archive, store.join("package.tar.xz")).or_else(|_| std::fs::copy(&archive, store.join("package.tar.xz")).map(|_| ()))?;
+    println!("{} ({} MB): publish it as a release asset, or copy {} into the VM store; on the phone: \
+              mship-system vm-install <its URL>", archive.display(), std::fs::metadata(&archive)?.len() >> 20, store.display());
     Ok(archive)
 }

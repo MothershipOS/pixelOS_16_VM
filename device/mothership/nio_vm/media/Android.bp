@@ -1,0 +1,23 @@
+// Hardware video decode (mship.video): the host's Venus decoder, a V4L2 stateful decoder in the guest through
+// virtio-media, as Codec2 components (external/v4l2_codec2, patched: pixelOS_16_VM/patches/external/v4l2_codec2)
+// registered over the AIDL Codec2 HAL (this build selects AIDL; v4l2_codec2 only ships a HIDL service).
+soong_namespace {
+    imports: ["external/v4l2_codec2"],
+}
+
+cc_binary {
+    name: "android.hardware.media.c2-service.mship-v4l2",
+    vendor: true,
+    relative_install_path: "hw",
+    defaults: ["libcodec2-aidl-defaults"],
+    srcs: ["service.cpp"],
+    shared_libs: [
+        "libavservices_minijail",
+        "libbinder_ndk",
+        "liblog",
+        "libv4l2_codec2_v4l2",
+    ],
+    init_rc: ["android.hardware.media.c2-service.mship-v4l2.rc"],
+    vintf_fragments: ["android.hardware.media.c2-service.mship-v4l2.xml"],
+    required: ["android.hardware.media.c2-default-seccomp_policy"],
+}

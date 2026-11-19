@@ -1,0 +1,120 @@
+mothershipOS (mship.video): MMAP bitstream buffers. The decoder is the host's Venus through virtio-media, which can
+only share virtio objects (e.g. virtio-gpu buffers) as DMABUFs; the client's linear blocks come from dmabuf heaps.
+The input queue now uses the device's MMAP buffers and copies each bitstream chunk in (tens of KB per frame);
+decoded frames still go straight into the client's gralloc buffers (DMABUF output queue).
+ro.vendor.v4l2_codec2.input_mmap=false restores the DMABUF input queue.
+
+diff --git a/v4l2/V4L2Decoder.cpp b/v4l2/V4L2Decoder.cpp
+index 182c196..5dc055d 100644
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -14,6 +14,8 @@
+ #include <vector>
+ 
+ #include <base/bind.h>
++#include <cutils/properties.h>
++#include <string.h>
+ #include <base/files/scoped_file.h>
+ #include <base/memory/ptr_util.h>
+ #include <log/log.h>
+@@ -206,7 +208,9 @@ bool V4L2Decoder::setupInputFormat(const uint32_t inputPixelFormat, const size_t
+     }
+     ALOG_ASSERT(format->fmt.pix_mp.pixelformat == inputPixelFormat);
+ 
+-    if (mInputQueue->allocateBuffers(kNumInputBuffers, V4L2_MEMORY_DMABUF) == 0) {
++    mInputMmap = property_get_bool("ro.vendor.v4l2_codec2.input_mmap", true);
++    if (mInputQueue->allocateBuffers(kNumInputBuffers,
++                                     mInputMmap ? V4L2_MEMORY_MMAP : V4L2_MEMORY_DMABUF) == 0) {
+         ALOGE("Failed to allocate input buffer.");
+         return false;
+     }
+@@ -459,6 +463,11 @@ void V4L2Decoder::pumpDecodeRequest() {
+             return;
+         }
+ 
++        if (mInputMmap) {
++            if (!queueMmapInput()) return;
++            continue;
++        }
++
+         auto dma_buf_id = getDmabufId(mDecodeRequests.front().buffer->dmabuf.handle()->data[0]);
+         if (!dma_buf_id) {
+             ALOGE("Failed to get dmabuf id");
+@@ -528,6 +537,53 @@ void V4L2Decoder::pumpDecodeRequest() {
+     }
+ }
+ 
++// mothershipOS: queue the front decode request in a MMAP input buffer (the bitstream copied in). false: no free
++// buffer (decoding resumes once one is dequeued) or an error (reported).
++bool V4L2Decoder::queueMmapInput() {
++    std::optional<V4L2WritableBufferRef> inputBuffer = mInputQueue->getFreeBuffer();
++    if (!inputBuffer) {
++        ALOGV("There is no free input buffer.");
++        return false;
++    }
++
++    auto request = std::move(mDecodeRequests.front());
++    mDecodeRequests.pop();
++
++    const int32_t bitstreamId = request.buffer->id;
++    ALOGV("QBUF to input queue (MMAP), bitstreadId=%d", bitstreamId);
++    inputBuffer->setTimeStamp({.tv_sec = bitstreamId});
++    const size_t planeSize = inputBuffer->getPlaneSize(0);
++    if (request.buffer->size > planeSize) {
++        ALOGE("The input size (%zu) is not enough, we need %zu", planeSize, request.buffer->size);
++        onError();
++        return false;
++    }
++    // the view starts at the block's offset (request.buffer->offset)
++    C2ReadView view = request.buffer->dmabuf.map().get();
++    if (view.error() != C2_OK || view.capacity() < request.buffer->size) {
++        ALOGE("%s(): cannot map the bitstream (%d)", __func__, view.error());
++        onError();
++        return false;
++    }
++    void* dst = inputBuffer->getPlaneMapping(0);
++    if (dst == nullptr) {
++        ALOGE("%s(): cannot map input buffer %zu", __func__, inputBuffer->bufferId());
++        onError();
++        return false;
++    }
++    memcpy(dst, view.data(), request.buffer->size);
++    inputBuffer->setPlaneDataOffset(0, 0);
++    inputBuffer->setPlaneBytesUsed(0, request.buffer->size);
++    if (!std::move(*inputBuffer).queueMMap()) {
++        ALOGE("%s(): Failed to QBUF to input queue, bitstreamId=%d", __func__, bitstreamId);
++        onError();
++        return false;
++    }
++
++    mPendingDecodeCbs.insert(std::make_pair(bitstreamId, std::move(request.decodeCb)));
++    return true;
++}
++
+ void V4L2Decoder::flush() {
+     ATRACE_CALL();
+     ALOGV("%s()", __func__);
+diff --git a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+index e537f0c..408cd62 100644
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+@@ -73,6 +73,7 @@ private:
+                const size_t minNumOutputBuffers, GetPoolCB getPoolCb, OutputCB outputCb,
+                ErrorCB errorCb, bool isSecure);
+     bool setupInputFormat(const uint32_t inputPixelFormat, const size_t inputBufferSize);
++    bool queueMmapInput();
+ 
+     // Sets minimal resolution and allocates minimal amount of output buffers for
+     // drain done signaling.
+@@ -116,6 +117,11 @@ private:
+     std::map<int32_t, DecodeCB> mPendingDecodeCbs;
+     // Marks that we need to wait for DRC before drain can complete.
+     bool mPendingDRC = false;
++
++    // mothershipOS: MMAP input buffers, the bitstream copied in (ro.vendor.v4l2_codec2.input_mmap, default true).
++    // A DMABUF input buffer must be shareable with the decoder: through virtio-media only virtio objects are, and
++    // the client's linear blocks (dmabuf heaps) are not.
++    bool mInputMmap = true;
+     // Holds information about secure playback, which won't allow decoder to
+     // access frames in order to provide extra meta information (like checking
+     // for pending DRC).

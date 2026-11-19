@@ -1,0 +1,279 @@
+mothershipOS (mship.video): the visible rectangle from the bitstream. Venus' firmware does not report crop
+information for every codec; its compose rectangle is then the coded size and a 1080p stream came out as 1920x1088
+(8 extra rows: a green bar at the bottom for VP9, repeated pixels for H.264). The decoder now reads each key frame's
+own visible size as it copies the bitstream in (H.264 SPS frame cropping, HEVC SPS conformance window, VP9/VP8 key
+frame size) and uses it when the device's rectangle is exactly the coded size.
+
+--- a/common/H264NalParser.cpp
++++ b/common/H264NalParser.cpp
+@@ -97,6 +97,85 @@
+     return *mCurrNalDataPos & kNALTypeMask;
+ }
+ 
++bool H264NalParser::findVisibleRect(uint32_t* left, uint32_t* top, uint32_t* width,
++                                    uint32_t* height) {
++    ALOG_ASSERT(type() == kSPSType);
++    NALBitReader br(mCurrNalDataPos + 1, length() - 1);
++
++    uint32_t unused;
++    uint32_t profileIDC;
++    if (!br.getBitsGraceful(8, &profileIDC)) return false;  // profile_idc
++    br.skipBits(16);        // constraint flags + reserved bits + level_idc
++    parseUE(&br, &unused);  // seq_parameter_set_id
++
++    uint32_t chromaFormatIDC = 1;
++    uint32_t separateColourPlane = 0;
++    if (profileIDC == kProfileIDCHigh || profileIDC == kProfileIDHigh10 ||
++        profileIDC == kProfileIDHigh422 || profileIDC == kProfileIDHigh444Predictive ||
++        profileIDC == kProfileIDCAVLC444 || profileIDC == kProfileIDScalableBaseline ||
++        profileIDC == kProfileIDScalableHigh || profileIDC == kProfileIDSMultiviewHigh ||
++        profileIDC == kProfileIDStereoHigh) {
++        if (!parseUE(&br, &chromaFormatIDC)) return false;
++        if (chromaFormatIDC == kYUV444Idc) {
++            if (!br.getBitsGraceful(1, &separateColourPlane)) return false;
++        }
++        parseUE(&br, &unused);  // bit_depth_luma_minus8
++        parseUE(&br, &unused);  // bit_depth_chroma_minus8
++        br.skipBits(1);         // lossless_qpprime_y_zero_flag
++        uint32_t seqScalingMatrixPresentFlag;
++        if (!br.getBitsGraceful(1, &seqScalingMatrixPresentFlag)) return false;
++        if (seqScalingMatrixPresentFlag) {
++            const size_t numScalingLists = (chromaFormatIDC != kYUV444Idc) ? 8 : 12;
++            if (!skipScalingMatrix(&br, numScalingLists)) return false;
++        }
++    }
++
++    parseUE(&br, &unused);  // log2_max_frame_num_minus4
++    uint32_t pictureOrderCountType;
++    if (!parseUE(&br, &pictureOrderCountType)) return false;
++    if (pictureOrderCountType == 0) {
++        parseUE(&br, &unused);  // log2_max_pic_order_cnt_lsb_minus4
++    } else if (pictureOrderCountType == 1) {
++        br.skipBits(1);  // delta_pic_order_always_zero_flag
++        int32_t unused_i;
++        parseSE(&br, &unused_i);  // offset_for_non_ref_pic
++        parseSE(&br, &unused_i);  // offset_for_top_to_bottom_field
++        uint32_t numReferenceFrames;
++        if (!parseUE(&br, &numReferenceFrames)) return false;
++        for (uint32_t i = 0; i < numReferenceFrames; ++i) parseUE(&br, &unused);
++    }
++    parseUE(&br, &unused);  // num_ref_frames
++    br.skipBits(1);         // gaps_in_frame_num_value_allowed_flag
++    uint32_t widthInMbsMinus1, heightInMapUnitsMinus1, frameMbsOnlyFlag;
++    if (!parseUE(&br, &widthInMbsMinus1)) return false;
++    if (!parseUE(&br, &heightInMapUnitsMinus1)) return false;
++    if (!br.getBitsGraceful(1, &frameMbsOnlyFlag)) return false;
++    if (!frameMbsOnlyFlag) br.skipBits(1);  // mb_adaptive_frame_field_flag
++    br.skipBits(1);                         // direct_8x8_inference_flag
++
++    const uint32_t codedWidth = (widthInMbsMinus1 + 1) * 16;
++    const uint32_t codedHeight = (2 - frameMbsOnlyFlag) * (heightInMapUnitsMinus1 + 1) * 16;
++    uint32_t cropLeft = 0, cropRight = 0, cropTop = 0, cropBottom = 0;
++    uint32_t frameCroppingFlag;
++    if (!br.getBitsGraceful(1, &frameCroppingFlag)) return false;
++    if (frameCroppingFlag) {
++        if (!parseUE(&br, &cropLeft) || !parseUE(&br, &cropRight) || !parseUE(&br, &cropTop) ||
++            !parseUE(&br, &cropBottom))
++            return false;
++    }
++    // crop units (H.264 7.4.2.1.1): 4:2:0 -> 2x2, 4:2:2 -> 2x1, 4:4:4/monochrome -> 1x1; fields double y
++    const uint32_t chroma = separateColourPlane ? 0 : chromaFormatIDC;
++    const uint32_t unitX = (chroma == 1 || chroma == 2) ? 2 : 1;
++    const uint32_t unitY = ((chroma == 1) ? 2 : 1) * (2 - frameMbsOnlyFlag);
++    if ((cropLeft + cropRight) * unitX >= codedWidth || (cropTop + cropBottom) * unitY >= codedHeight)
++        return false;
++    *left = cropLeft * unitX;
++    *top = cropTop * unitY;
++    *width = codedWidth - (cropLeft + cropRight) * unitX;
++    *height = codedHeight - (cropTop + cropBottom) * unitY;
++    return true;
++}
++
+ bool H264NalParser::findCodedColorAspects(ColorAspects* colorAspects) {
+     ALOG_ASSERT(colorAspects);
+     ALOG_ASSERT(type() == kSPSType);
+--- a/common/HEVCNalParser.cpp
++++ b/common/HEVCNalParser.cpp
+@@ -218,6 +218,48 @@
+     return (*mCurrNalDataPos & kNALTypeMask) >> 1;
+ }
+ 
++bool HEVCNalParser::findVisibleRect(uint32_t* left, uint32_t* top, uint32_t* width,
++                                    uint32_t* height) {
++    ALOG_ASSERT(type() == kSPSType);
++    if (length() <= 2) return false;
++    NALBitReader br(mCurrNalDataPos + 2, length() - 2);
++
++    br.skipBits(4);  // sps_video_parameter_set_id
++    uint32_t spsMaxSublayersMinus1;
++    if (!br.getBitsGraceful(3, &spsMaxSublayersMinus1)) return false;
++    br.skipBits(1);  // sps_temporal_id_nesting_flag
++    if (!skipProfileTierLevel(&br, spsMaxSublayersMinus1)) return false;
++
++    uint32_t unused;
++    parseUE(&br, &unused);  // sps_seq_parameter_set_id
++    uint32_t chromaFormatIdc;
++    if (!parseUE(&br, &chromaFormatIdc)) return false;
++    uint32_t separateColourPlane = 0;
++    if (chromaFormatIdc == 3 && !br.getBitsGraceful(1, &separateColourPlane)) return false;
++    uint32_t codedWidth, codedHeight;
++    if (!parseUE(&br, &codedWidth) || !parseUE(&br, &codedHeight)) return false;
++
++    uint32_t confLeft = 0, confRight = 0, confTop = 0, confBottom = 0;
++    uint32_t conformanceWindowFlag;
++    if (!br.getBitsGraceful(1, &conformanceWindowFlag)) return false;
++    if (conformanceWindowFlag) {
++        if (!parseUE(&br, &confLeft) || !parseUE(&br, &confRight) || !parseUE(&br, &confTop) ||
++            !parseUE(&br, &confBottom))
++            return false;
++    }
++    // SubWidthC/SubHeightC (HEVC table 6-1)
++    const uint32_t chroma = separateColourPlane ? 0 : chromaFormatIdc;
++    const uint32_t unitX = (chroma == 1 || chroma == 2) ? 2 : 1;
++    const uint32_t unitY = (chroma == 1) ? 2 : 1;
++    if ((confLeft + confRight) * unitX >= codedWidth || (confTop + confBottom) * unitY >= codedHeight)
++        return false;
++    *left = confLeft * unitX;
++    *top = confTop * unitY;
++    *width = codedWidth - (confLeft + confRight) * unitX;
++    *height = codedHeight - (confTop + confBottom) * unitY;
++    return true;
++}
++
+ bool HEVCNalParser::findCodedColorAspects(ColorAspects* colorAspects) {
+     ALOG_ASSERT(colorAspects);
+     ALOG_ASSERT(type() == kSPSType);
+--- a/common/include/v4l2_codec2/common/H264NalParser.h
++++ b/common/include/v4l2_codec2/common/H264NalParser.h
+@@ -33,6 +33,9 @@
+ 
+     // Find the H.264 video's color aspects in the current SPS NAL.
+     bool findCodedColorAspects(ColorAspects* colorAspects) override;
++
++    // mothershipOS: the visible rectangle (the SPS cropping / conformance window) from the current SPS NAL.
++    bool findVisibleRect(uint32_t* left, uint32_t* top, uint32_t* width, uint32_t* height);
+ };
+ 
+ }  // namespace android
+--- a/common/include/v4l2_codec2/common/HEVCNalParser.h
++++ b/common/include/v4l2_codec2/common/HEVCNalParser.h
+@@ -30,6 +30,9 @@
+ 
+     // Find the HEVC video's color aspects in the current SPS NAL.
+     bool findCodedColorAspects(ColorAspects* colorAspects) override;
++
++    // mothershipOS: the visible rectangle (the SPS cropping / conformance window) from the current SPS NAL.
++    bool findVisibleRect(uint32_t* left, uint32_t* top, uint32_t* width, uint32_t* height);
+ };
+ 
+ }  // namespace android
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+@@ -122,6 +122,10 @@
+     // A DMABUF input buffer must be shareable with the decoder: through virtio-media only virtio objects are, and
+     // the client's linear blocks (dmabuf heaps) are not.
+     bool mInputMmap = true;
++
++    // mothershipOS: the visible rectangle of the last key frame / SPS seen in the bitstream. Venus firmware does not
++    // always report crop information: its compose rectangle is then the coded size (1920x1088 for 1080p).
++    std::optional<Rect> mStreamVisibleRect;
+     // Holds information about secure playback, which won't allow decoder to
+     // access frames in order to provide extra meta information (like checking
+     // for pending DRC).
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -63,6 +63,68 @@
+     return false;
+ }
+ 
++// mothershipOS: the visible rectangle a bitstream chunk declares, if it has a key frame / SPS (std::nullopt
++// otherwise): H.264/HEVC SPS cropping window, VP9/VP8 key frame size.
++std::optional<Rect> findStreamVisibleRect(const uint8_t* data, size_t size, VideoCodec codec) {
++    uint32_t left = 0, top = 0, width = 0, height = 0;
++    switch (codec) {
++    case VideoCodec::H264: {
++        H264NalParser parser(data, size);
++        if (!parser.locateSPS() || !parser.findVisibleRect(&left, &top, &width, &height))
++            return std::nullopt;
++        break;
++    }
++    case VideoCodec::HEVC: {
++        HEVCNalParser parser(data, size);
++        if (!parser.locateSPS() || !parser.findVisibleRect(&left, &top, &width, &height))
++            return std::nullopt;
++        break;
++    }
++    case VideoCodec::VP9: {
++        // uncompressed header (VP9 spec 6.2): frame_marker(2) profile(2) [reserved(1) if profile 3]
++        // show_existing_frame(1) frame_type(1) show_frame(1) error_resilient_mode(1), then for key frames the
++        // sync code 0x498342, color_config and frame_width_minus_1(16) frame_height_minus_1(16)
++        if (size < 12) return std::nullopt;
++        size_t bit = 0;
++        auto get = [&](int n) {
++            uint32_t v = 0;
++            for (int i = 0; i < n; i++, bit++) v = (v << 1) | ((data[bit / 8] >> (7 - bit % 8)) & 1);
++            return v;
++        };
++        if (get(2) != 2) return std::nullopt;  // frame_marker
++        const uint32_t profileLow = get(1);
++        const uint32_t profile = (get(1) << 1) | profileLow;
++        if (profile == 3) get(1);
++        if (get(1)) return std::nullopt;  // show_existing_frame
++        if (get(1) != 0) return std::nullopt;  // frame_type: not a key frame
++        get(2);  // show_frame, error_resilient_mode
++        if (get(24) != 0x498342) return std::nullopt;
++        if (profile >= 2) get(1);  // ten_or_twelve_bit
++        const uint32_t colorSpace = get(3);
++        if (colorSpace != 7) {  // not CS_RGB
++            get(1);             // color_range
++            if (profile == 1 || profile == 3) get(3);  // subsampling_x, subsampling_y, reserved
++        } else if (profile == 1 || profile == 3) {
++            get(1);  // reserved
++        }
++        if ((bit + 32 + 7) / 8 > size) return std::nullopt;
++        width = get(16) + 1;
++        height = get(16) + 1;
++        break;
++    }
++    case VideoCodec::VP8: {
++        // frame tag (3 bytes, bit 0: 0 = key frame), start code 9d 01 2a, 14-bit width and height (little endian)
++        if (size < 10 || (data[0] & 1) != 0) return std::nullopt;
++        if (data[3] != 0x9d || data[4] != 0x01 || data[5] != 0x2a) return std::nullopt;
++        width = (data[6] | (data[7] << 8)) & 0x3fff;
++        height = (data[8] | (data[9] << 8)) & 0x3fff;
++        break;
++    }
++    }
++    if (width == 0 || height == 0) return std::nullopt;
++    return Rect(left, top, left + width, top + height);
++}
++
+ }  // namespace
+ 
+ // static
+@@ -579,6 +641,9 @@
+         return false;
+     }
+     memcpy(dst, view.data(), request.buffer->size);
++    if (auto rect = findStreamVisibleRect(view.data(), request.buffer->size, mCodec)) {
++        mStreamVisibleRect = rect;
++    }
+     inputBuffer->setPlaneDataOffset(0, 0);
+     inputBuffer->setPlaneBytesUsed(0, request.buffer->size);
+     if (!std::move(*inputBuffer).queueMMap()) {
+@@ -1041,6 +1106,15 @@
+         return Rect(codedSize.width, codedSize.height);
+     }
+ 
++    // mothershipOS: a rectangle of exactly the coded size means the device had no crop information: take the
++    // bitstream's own (SPS cropping / key frame size) when it fits
++    if (rect == Rect(codedSize.width, codedSize.height) && mStreamVisibleRect &&
++        !mStreamVisibleRect->isEmpty() &&
++        contains(Rect(codedSize.width, codedSize.height), *mStreamVisibleRect)) {
++        ALOGV("visible rectangle from the bitstream: %s", toString(*mStreamVisibleRect).c_str());
++        return *mStreamVisibleRect;
++    }
++
+     return rect;
+ }
+ 

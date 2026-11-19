@@ -21,6 +21,11 @@ PRODUCT_PACKAGES += libEGL_mesa libGLESv2_mesa libGLESv1_CM_mesa libgallium_dri 
 # op (Mesa is built with the NDK: no libui, so no IMapper5 backend)
 PRODUCT_PACKAGES += gralloc.minigbm
 
+# Audio (mship.audio): the guest's virtio-snd card has one PCM per phone audio device and the headset jack; the
+# stock AIDL HAL and Cuttlefish's policy know these devices (pixelOS_16_VM/patches: hardware/interfaces 0002,
+# device/google/cuttlefish 0004), the framework connects wired devices on the jack's input switches (overlay)
+DEVICE_PACKAGE_OVERLAYS += device/mothership/nio_vm/overlay
+
 # Cameras (mship.camera): the host's cameras are V4L2 capture devices (virtio-media), used by AOSP's external camera
 # HAL (patched for their BGRx frames: pixelOS_16_VM/patches/hardware/interfaces). Cuttlefish's emulated cameras are
 # left out (TARGET_CF_NO_EMULATED_CAMERA in custom_nio_vm.mk).
@@ -29,3 +34,15 @@ DEVICE_MANIFEST_FILE += device/mothership/nio_vm/camera/manifest.xml
 PRODUCT_COPY_FILES += \
     device/mothership/nio_vm/camera/external_camera_config.xml:$(TARGET_COPY_OUT_VENDOR)/etc/external_camera_config.xml \
     frameworks/native/data/etc/android.hardware.camera.external.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.camera.external.xml
+
+# Hardware video decode (mship.video): the host's Venus decoder is a V4L2 stateful decoder here (virtio-media);
+# external/v4l2_codec2 (patched: MMAP bitstream buffers, decoded frames straight into gralloc buffers as virtio
+# objects) serves it as c2.v4l2.* Codec2 components over the AIDL HAL (media/)
+PRODUCT_SOONG_NAMESPACES += external/v4l2_codec2 device/mothership/nio_vm/media
+PRODUCT_PACKAGES += android.hardware.media.c2-service.mship-v4l2
+PRODUCT_COPY_FILES += \
+    device/mothership/nio_vm/media/media_codecs_c2.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_c2.xml \
+    device/mothership/nio_vm/media/android.hardware.media.c2-extended-seccomp_policy:$(TARGET_COPY_OUT_VENDOR)/etc/seccomp_policy/android.hardware.media.c2-extended-seccomp_policy
+PRODUCT_VENDOR_PROPERTIES += \
+    ro.vendor.v4l2_codec2.decode_concurrent_instances=8 \
+    ro.vendor.v4l2_codec2.initial_output=false

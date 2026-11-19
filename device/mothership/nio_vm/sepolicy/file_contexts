@@ -5,3 +5,5 @@
 /vendor/lib(64)?/libgallium_dri\.so       u:object_r:same_process_hal_file:s0
 /vendor/lib(64)?/hw/vulkan\.freedreno\.so u:object_r:same_process_hal_file:s0
 /vendor/lib(64)?/hw/gralloc\.minigbm\.so    u:object_r:same_process_hal_file:s0
+# mship.video: the V4L2 Codec2 service (AOSP's mediacodec domain: video_device, gralloc, dmabuf heaps)
+/vendor/bin/hw/android\.hardware\.media\.c2-service\.mship-v4l2  u:object_r:mediacodec_exec:s0

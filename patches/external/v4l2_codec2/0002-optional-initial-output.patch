@@ -1,0 +1,22 @@
+mothershipOS (mship.video): optional initial output. The decoder set up CAPTURE (format, buffers, an EOS buffer)
+right after the OUTPUT queue, before any bitstream: fine with ARCVM's virtio-video host, but a stateful decoder that
+follows the V4L2 spec (Venus through virtio-media) has no CAPTURE format until it parsed the stream header, its
+VIDIOC_G_FMT fails (after a 100 ms wait) and the component could not start. With
+ro.vendor.v4l2_codec2.initial_output=false CAPTURE starts on the first source change event (the spec's flow);
+default true keeps upstream's behaviour.
+
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -171,7 +171,11 @@
+         ALOGE("Failed to setup input format.");
+         return false;
+     }
+-    if (!setupInitialOutput()) {
++    // mothershipOS: the initial output (CAPTURE buffers and an EOS buffer before any bitstream) suits ARCVM's
++    // virtio-video; a stateful decoder that follows the V4L2 spec (Venus) only has a CAPTURE format once it parsed
++    // the stream header (its G_FMT fails until then). Without it, CAPTURE starts on the first source change event.
++    // ro.vendor.v4l2_codec2.initial_output=false (default true: upstream)
++    if (property_get_bool("ro.vendor.v4l2_codec2.initial_output", true) && !setupInitialOutput()) {
+         ALOGE("Unable to setup initial output");
+         return false;
+     }

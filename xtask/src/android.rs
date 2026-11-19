@@ -7,7 +7,7 @@
 //!   ramdisk + generic ramdisk + bootconfig), cmdline, the partition images, virtio_balloon.ko (not on Cuttlefish's
 //!   load list; the VM pool needs it)
 //! - `android-initrd <pkg dir>`: the crosvm initrds from it, one per GPU mode (initrd-crosvm-native.img: DRM
-//!   native context; initrd-crosvm.img: gfxstream), with the guest modules (mship_wifi.ko, virtio-media.ko,
+//!   native context; initrd-crosvm.img: gfxstream), with the guest modules (mship_wifi.ko, virtio-media.ko, virtio-gpu.ko,
 //!   virtio_balloon.ko in the package) in the first-stage ramdisk, and cmdline.crosvm
 //!
 //! The VM's disk is made on the phone from the package's images (pixelos-install, see release.rs).
@@ -254,9 +254,16 @@ pub fn initrd(pkg: &Path) -> Result<()> {
     if wifi.exists() {
         mods.push((wifi.clone(), vec!["cfg80211.ko", "rfkill.ko"]));
     }
-    // the virtio-media V4L2 bridge (mship.video: the host's Venus decoder; all symbols from the GKI vmlinux)
+    // the virtio-media V4L2 bridge (mship.video: the host's Venus decoder); DMABUF buffers as virtio objects need
+    // virtio_dma_buf.ko (Cuttlefish's, in the ramdisk)
     if media.exists() {
-        mods.push((media, vec![]));
+        mods.push((media, vec!["virtio_dma_buf.ko"]));
+    }
+    // virtio-gpu, patched (guest/drivers/virtio_gpu: page flips complete when the frame is on screen), in place of
+    // Cuttlefish's module of the same name
+    let gpu = pkg.join("virtio-gpu.ko");
+    if gpu.exists() {
+        mods.push((gpu, vec!["virtio_dma_buf.ko"]));
     }
     // virtio-balloon (the VM pool: RAM lent and taken back, page reporting), from the package
     let balloon = pkg.join("virtio_balloon.ko");

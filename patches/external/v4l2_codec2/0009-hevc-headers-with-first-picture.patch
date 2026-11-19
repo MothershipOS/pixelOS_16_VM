@@ -1,0 +1,118 @@
+mothershipOS (mship.video): HEVC codec config in front of the first picture. Venus (SM8250, VIDEO.VPU.1.0-00119)
+drops an HEVC buffer that holds only headers (VPS/SPS/PPS/SEI, i.e. the codec config Android sends first): no
+source change, no buffer back, the decoder waits forever. A buffer without a coded picture (no VCL NAL unit) is now
+completed at once and its bytes go in front of the next picture's (as players that prepend extradata do); the last
+headers are prepended again after a flush, which restarts the stream. H.264 takes header-only buffers and is left
+as it is.
+
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+@@ -126,6 +126,12 @@
+     // mothershipOS: the visible rectangle of the last key frame / SPS seen in the bitstream. Venus firmware does not
+     // always report crop information: its compose rectangle is then the coded size (1920x1088 for 1080p).
+     std::optional<Rect> mStreamVisibleRect;
++
++    // mothershipOS: HEVC buffers without a picture (parameter sets, SEI: the codec config) wait here for the next
++    // picture, which carries them; Venus drops a buffer with headers only. The last ones are kept to go in front of
++    // the first picture after a flush.
++    std::vector<uint8_t> mHevcPrefix;
++    std::vector<uint8_t> mHevcHeaders;
+     // Holds information about secure playback, which won't allow decoder to
+     // access frames in order to provide extra meta information (like checking
+     // for pending DRC).
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -63,6 +63,16 @@
+     return false;
+ }
+ 
++// mothershipOS: whether an HEVC chunk carries a coded picture (a VCL NAL unit: nal_unit_type 0-31)
++bool hevcHasPicture(const uint8_t* data, size_t size) {
++    HEVCNalParser parser(data, size);
++    while (parser.locateNextNal()) {
++        if (parser.length() == 0) continue;
++        if (parser.type() < 32) return true;
++    }
++    return false;
++}
++
+ // mothershipOS: the visible rectangle a bitstream chunk declares, if it has a key frame / SPS (std::nullopt
+ // otherwise): H.264/HEVC SPS cropping window, VP9/VP8 key frame size.
+ std::optional<Rect> findStreamVisibleRect(const uint8_t* data, size_t size, VideoCodec codec) {
+@@ -609,6 +619,29 @@
+ // mothershipOS: queue the front decode request in a MMAP input buffer (the bitstream copied in). false: no free
+ // buffer (decoding resumes once one is dequeued) or an error (reported).
+ bool V4L2Decoder::queueMmapInput() {
++    // the view starts at the block's offset (request.buffer->offset)
++    C2ReadView view = mDecodeRequests.front().buffer->dmabuf.map().get();
++    const size_t size = mDecodeRequests.front().buffer->size;
++    if (view.error() != C2_OK || view.capacity() < size) {
++        ALOGE("%s(): cannot map the bitstream (%d)", __func__, view.error());
++        onError();
++        return false;
++    }
++
++    // HEVC headers without a picture: done at once, they go in front of the next picture
++    if (mCodec == VideoCodec::HEVC && !hevcHasPicture(view.data(), size)) {
++        mHevcPrefix.insert(mHevcPrefix.end(), view.data(), view.data() + size);
++        mHevcHeaders = mHevcPrefix;
++        if (auto rect = findStreamVisibleRect(view.data(), size, mCodec)) {
++            mStreamVisibleRect = rect;
++        }
++        auto request = std::move(mDecodeRequests.front());
++        mDecodeRequests.pop();
++        mTaskRunner->PostTask(FROM_HERE, ::base::BindOnce(std::move(request.decodeCb),
++                                                          VideoDecoder::DecodeStatus::kOk));
++        return true;
++    }
++
+     std::optional<V4L2WritableBufferRef> inputBuffer = mInputQueue->getFreeBuffer();
+     if (!inputBuffer) {
+         ALOGV("There is no free input buffer.");
+@@ -622,15 +655,9 @@
+     ALOGV("QBUF to input queue (MMAP), bitstreadId=%d", bitstreamId);
+     inputBuffer->setTimeStamp({.tv_sec = bitstreamId});
+     const size_t planeSize = inputBuffer->getPlaneSize(0);
+-    if (request.buffer->size > planeSize) {
+-        ALOGE("The input size (%zu) is not enough, we need %zu", planeSize, request.buffer->size);
+-        onError();
+-        return false;
+-    }
+-    // the view starts at the block's offset (request.buffer->offset)
+-    C2ReadView view = request.buffer->dmabuf.map().get();
+-    if (view.error() != C2_OK || view.capacity() < request.buffer->size) {
+-        ALOGE("%s(): cannot map the bitstream (%d)", __func__, view.error());
++    const size_t total = mHevcPrefix.size() + size;
++    if (total > planeSize) {
++        ALOGE("The input size (%zu) is not enough, we need %zu", planeSize, total);
+         onError();
+         return false;
+     }
+@@ -640,12 +667,16 @@
+         onError();
+         return false;
+     }
+-    memcpy(dst, view.data(), request.buffer->size);
++    if (!mHevcPrefix.empty()) {
++        memcpy(dst, mHevcPrefix.data(), mHevcPrefix.size());
++    }
++    memcpy(static_cast<uint8_t*>(dst) + mHevcPrefix.size(), view.data(), size);
++    mHevcPrefix.clear();
+     if (auto rect = findStreamVisibleRect(view.data(), request.buffer->size, mCodec)) {
+         mStreamVisibleRect = rect;
+     }
+     inputBuffer->setPlaneDataOffset(0, 0);
+-    inputBuffer->setPlaneBytesUsed(0, request.buffer->size);
++    inputBuffer->setPlaneBytesUsed(0, total);
+     if (!std::move(*inputBuffer).queueMMap()) {
+         ALOGE("%s(): Failed to QBUF to input queue, bitstreamId=%d", __func__, bitstreamId);
+         onError();
+@@ -700,6 +731,8 @@
+     mFrameAtDevice.clear();
+ 
+     mInputQueue->streamoff();
++    // mothershipOS: the restarted stream needs the HEVC headers again, in front of its first picture
++    mHevcPrefix = mHevcHeaders;
+ 
+     // Streamon both V4L2 queues.
+     mInputQueue->streamon();

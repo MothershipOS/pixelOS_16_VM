@@ -1,0 +1,19 @@
+mothershipOS (mship.video): a real initial bitstream size. The decoder set the OUTPUT format with an empty size;
+Venus then picks its maximum (8192x8192 for H.264) and VIDIOC_STREAMON fails allocating internal buffers for it
+(-ENOMEM), so H.264 never started (VP9's maximum is smaller). Start from 1080p; the stream's own size comes with
+the first source change event.
+
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -205,7 +205,10 @@
+     }
+ 
+     // Setup the input format.
+-    auto format = mInputQueue->setFormat(inputPixelFormat, ui::Size(), inputBufferSize, 0);
++    // mothershipOS: an empty size lets the driver choose; Venus then takes its maximum (8192x8192 for H.264) and
++    // STREAMON fails allocating internal buffers for it (-ENOMEM). The stream's real size comes with the first
++    // source change event; start from 1080p.
++    auto format = mInputQueue->setFormat(inputPixelFormat, ui::Size(1920, 1080), inputBufferSize, 0);
+     if (!format) {
+         ALOGE("Failed to call IOCTL to set input format.");
+         return false;
