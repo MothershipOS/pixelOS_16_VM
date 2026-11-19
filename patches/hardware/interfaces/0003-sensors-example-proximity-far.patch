@@ -1,0 +1,19 @@
+mothershipOS: the example sensors HAL's proximity sensor reports "far" (its maximum range) instead of a constant
+2.5, which Android reads as covered: SystemUI's falsing classifier rejected lock screen swipe-ups
+(ProximityClassifier percentInProximity=1.0, "the swipe jumps back unless pulled far") and in a call the screen would
+turn off. Until the phone's real sensors reach the VM, nothing is near the screen.
+
+diff -ruN a/sensors/aidl/default/Sensor.cpp b/sensors/aidl/default/Sensor.cpp
+--- a/sensors/aidl/default/Sensor.cpp	2026-11-17 23:25:52.420693117 +0100
++++ b/sensors/aidl/default/Sensor.cpp	2026-11-17 23:25:52.437234111 +0100
+@@ -333,7 +333,9 @@
+ };
+ 
+ void ProximitySensor::readEventPayload(EventPayload& payload) {
+-    payload.set<EventPayload::Tag::scalar>(2.5f);
++    // mothershipOS: "far" (the maximum range). 2.5 (< maxRange) read as permanently covered: SystemUI's falsing
++    // classifier rejected lock screen swipes (percentInProximity=1.0) and calls would blank the screen.
++    payload.set<EventPayload::Tag::scalar>(mSensorInfo.maxRange);
+ }
+ 
+ GyroSensor::GyroSensor(int32_t sensorHandle, ISensorsEventCallback* callback) : Sensor(callback) {

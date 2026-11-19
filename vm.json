@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "name": "PixelOS (Android 16)",
+  "cid": 3,
   "min_mothership": "2026.1",
   "platform": {
     "id": "cuttlefish-arm64",
@@ -12,6 +13,7 @@
     "cmdline": "pkg/cmdline.crosvm",
     "disk": "disk.img"
   },
+  "display_mode": "lease",
   "slots": {
     "display": {
       "contract": "mship.display",
@@ -67,6 +69,11 @@
     },
     "camera": {
       "contract": "mship.camera",
+      "version": "1.0",
+      "required": false
+    },
+    "audio": {
+      "contract": "mship.audio",
       "version": "1.0",
       "required": false
     }

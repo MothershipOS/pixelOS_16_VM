@@ -1,0 +1,114 @@
+mothershipOS (mship display): real present fences for the ranchu HWC. The guest virtio-gpu fences
+every primary flush (guest/drivers/virtio_gpu), so the blocking commit returns once the frame is on
+the host panel and its out fence's signal time is the present time. The HWC no longer reports
+PRESENT_FENCE_IS_NOT_RELIABLE, and its software vsync is phase-locked (low-pass) to those present
+times, so SurfaceFlinger's vsync model, hardware vsync and present fences all follow the panel
+(device/google/cuttlefish 0005 turns the sync framework on).
+
+diff -ruN a/hals/hwc3/Composer.cpp b/hals/hwc3/Composer.cpp
+--- a/hals/hwc3/Composer.cpp	2026-11-18 05:09:24.117386813 +0000
++++ b/hals/hwc3/Composer.cpp	2026-11-18 05:09:24.150387687 +0000
+@@ -95,7 +95,8 @@
+     DEBUG_LOG("%s", __FUNCTION__);
+ 
+     caps->clear();
+-    caps->emplace_back(Capability::PRESENT_FENCE_IS_NOT_RELIABLE);
++    // mothershipOS: the guest virtio-gpu fences every primary flush (guest/drivers/virtio_gpu), so the
++    // commit's out fence signals when the frame is on the host panel: a real present time
+     caps->emplace_back(Capability::BOOT_DISPLAY_CONFIG);
+ 
+     return ndk::ScopedAStatus::ok();
+diff -ruN a/hals/hwc3/Display.cpp b/hals/hwc3/Display.cpp
+--- a/hals/hwc3/Display.cpp	2026-11-18 05:09:24.118386840 +0000
++++ b/hals/hwc3/Display.cpp	2026-11-18 05:09:24.151387714 +0000
+@@ -914,7 +914,22 @@
+         return HWC3::Error::NoResources;
+     }
+ 
+-    return mComposer->presentDisplay(this, outDisplayFence, outLayerFences);
++    HWC3::Error error = mComposer->presentDisplay(this, outDisplayFence, outLayerFences);
++    // the commit blocks until the flip completes: its out fence has signaled at the present time
++    if (error == HWC3::Error::None && outDisplayFence->ok()) {
++        if (struct sync_file_info* info = sync_file_info(outDisplayFence->get())) {
++            if (info->status == 1 && info->num_fences > 0) {
++                const struct sync_fence_info* fences = sync_get_fence_info(info);
++                uint64_t presented = 0;
++                for (uint32_t i = 0; i < info->num_fences; i++) {
++                    presented = std::max<uint64_t>(presented, fences[i].timestamp_ns);
++                }
++                mVsyncThread.presented(asTimePoint(static_cast<int64_t>(presented)));
++            }
++            sync_file_info_free(info);
++        }
++    }
++    return error;
+ }
+ 
+ bool Display::hasConfig(int32_t configId) const {
+diff -ruN a/hals/hwc3/VsyncThread.cpp b/hals/hwc3/VsyncThread.cpp
+--- a/hals/hwc3/VsyncThread.cpp	2026-11-18 05:09:24.121386919 +0000
++++ b/hals/hwc3/VsyncThread.cpp	2026-11-18 05:09:24.150387687 +0000
+@@ -122,6 +122,24 @@
+     return HWC3::Error::None;
+ }
+ 
++void VsyncThread::presented(TimePoint presented) {
++    std::unique_lock<std::mutex> lock(mStateMutex);
++    const auto period = mVsyncPeriod;
++    if (period.count() <= 0) {
++        return;
++    }
++    // presented - the vsync grid, wrapped into [-period/2, period/2)
++    auto error = Nanoseconds(presented - mPreviousVsync) % period;
++    if (error < Nanoseconds(0)) {
++        error += period;
++    }
++    if (error >= period / 2) {
++        error -= period;
++    }
++    // low-pass: present times carry the host's wakeup jitter
++    mPhaseCorrection = error / 4;
++}
++
+ Nanoseconds VsyncThread::updateVsyncPeriodLocked(TimePoint now) {
+     if (mPendingUpdate && now > mPendingUpdate->updateAfter) {
+         mVsyncPeriod = mPendingUpdate->period;
+@@ -141,7 +159,13 @@
+ 
+     while (!mShuttingDown.load()) {
+         TimePoint now = std::chrono::steady_clock::now();
+-        TimePoint nextVsync = GetNextVsyncInPhase(vsyncPeriod, mPreviousVsync, now);
++        TimePoint nextVsync;
++        {
++            std::unique_lock<std::mutex> lock(mStateMutex);
++            mPreviousVsync += mPhaseCorrection;
++            mPhaseCorrection = Nanoseconds(0);
++            nextVsync = GetNextVsyncInPhase(vsyncPeriod, mPreviousVsync, now);
++        }
+ 
+         std::this_thread::sleep_until(nextVsync);
+         {
+diff -ruN a/hals/hwc3/VsyncThread.h b/hals/hwc3/VsyncThread.h
+--- a/hals/hwc3/VsyncThread.h	2026-11-18 05:09:24.121386919 +0000
++++ b/hals/hwc3/VsyncThread.h	2026-11-18 05:09:24.150387687 +0000
+@@ -52,6 +52,10 @@
+         int32_t newVsyncPeriod, const VsyncPeriodChangeConstraints& newVsyncPeriodChangeConstraints,
+         VsyncPeriodChangeTimeline* timeline);
+ 
++    // A frame reached the panel at 'presented' (its present fence's signal time): pulls the vsync
++    // phase toward the real display, so these vsyncs agree with the present fences SurfaceFlinger sees
++    void presented(std::chrono::time_point<std::chrono::steady_clock> presented);
++
+    private:
+     HWC3::Error stop();
+ 
+@@ -79,6 +83,9 @@
+         std::chrono::time_point<std::chrono::steady_clock> updateAfter;
+     };
+     std::optional<PendingUpdate> mPendingUpdate;
++
++    // phase correction from presented(), applied before the next vsync is scheduled
++    std::chrono::nanoseconds mPhaseCorrection{0};
+ };
+ 
+ }  // namespace aidl::android::hardware::graphics::composer3::impl

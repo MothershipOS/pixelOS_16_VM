@@ -1,0 +1,206 @@
+mothershipOS (mship.audio): the primary module has the phone's audio devices, each its own ALSA
+PCM of the guest's virtio-snd card (0 speaker, 1 earpiece, 2 wired headset/headphones, 3 built-in
+mic, 4 back mic, 5 wired headset mic), so Android's audio policy routes between them natively.
+Earpiece and back mic are attached devices; wired headset, headphones and headset mic are analog
+template ports the framework connects on jack events (ModulePrimary accepts analog connections).
+StreamPrimary picks the PCM by device type when the address has no CARD_x_DEV_y; a card without
+that PCM (stock Cuttlefish) keeps using the default one. A running stream moves to the new device's
+PCM at once when the routing changes (stock: only at the next start, after a standby, so media kept
+playing on the headset after "Phone speaker" was picked).
+
+diff -ruN a/audio/aidl/default/Configuration.cpp b/audio/aidl/default/Configuration.cpp
+--- a/audio/aidl/default/Configuration.cpp	2026-11-17 16:41:19.233269144 +0100
++++ b/audio/aidl/default/Configuration.cpp	2026-11-17 16:41:34.779163217 +0100
+@@ -222,6 +222,43 @@
+                 createDynamicPortConfig(micInDevice.id, micInDevice.id, 0, true,
+                                         createDeviceExt(AudioDeviceType::IN_MICROPHONE, 0)));
+ 
++        // mothershipOS: the phone's other audio devices (mship.audio), each its own ALSA PCM
++        // (StreamPrimary::getCardAndDeviceId); wired ones are connected by the framework's wired
++        // accessory handling (jack input switches).
++        AudioPort earpieceOutDevice =
++                createPort(c.nextPortId++, "Earpiece", 0, false,
++                           createDeviceExt(AudioDeviceType::OUT_SPEAKER_EARPIECE, 0));
++        c.ports.push_back(earpieceOutDevice);
++        c.initialConfigs.push_back(createDynamicPortConfig(
++                earpieceOutDevice.id, earpieceOutDevice.id, 0, false,
++                createDeviceExt(AudioDeviceType::OUT_SPEAKER_EARPIECE, 0)));
++
++        AudioPort backMicInDevice =
++                createPort(c.nextPortId++, "Built-In Back Mic", 0, true,
++                           createDeviceExt(AudioDeviceType::IN_MICROPHONE_BACK, 0));
++        c.ports.push_back(backMicInDevice);
++        c.initialConfigs.push_back(createDynamicPortConfig(
++                backMicInDevice.id, backMicInDevice.id, 0, true,
++                createDeviceExt(AudioDeviceType::IN_MICROPHONE_BACK, 0)));
++
++        AudioPort headsetOutDevice =
++                createPort(c.nextPortId++, "Wired Headset", 0, false,
++                           createDeviceExt(AudioDeviceType::OUT_HEADSET, 0,
++                                           AudioDeviceDescription::CONNECTION_ANALOG));
++        c.ports.push_back(headsetOutDevice);
++
++        AudioPort headphonesOutDevice =
++                createPort(c.nextPortId++, "Wired Headphones", 0, false,
++                           createDeviceExt(AudioDeviceType::OUT_HEADPHONE, 0,
++                                           AudioDeviceDescription::CONNECTION_ANALOG));
++        c.ports.push_back(headphonesOutDevice);
++
++        AudioPort headsetMicInDevice =
++                createPort(c.nextPortId++, "Wired Headset Mic", 0, true,
++                           createDeviceExt(AudioDeviceType::IN_HEADSET, 0,
++                                           AudioDeviceDescription::CONNECTION_ANALOG));
++        c.ports.push_back(headsetMicInDevice);
++
+         AudioPort telephonyTxOutDevice =
+                 createPort(c.nextPortId++, "Telephony Tx", 0, false,
+                            createDeviceExt(AudioDeviceType::OUT_TELEPHONY_TX, 0));
+@@ -285,7 +322,11 @@
+         c.ports.push_back(fmTunerInMix);
+ 
+         c.routes.push_back(createRoute({primaryOutMix}, speakerOutDevice));
+-        c.routes.push_back(createRoute({micInDevice}, primaryInMix));
++        c.routes.push_back(createRoute({primaryOutMix}, earpieceOutDevice));
++        c.routes.push_back(createRoute({primaryOutMix}, headsetOutDevice));
++        c.routes.push_back(createRoute({primaryOutMix}, headphonesOutDevice));
++        c.routes.push_back(
++                createRoute({micInDevice, backMicInDevice, headsetMicInDevice}, primaryInMix));
+         c.routes.push_back(createRoute({telephonyRxInDevice}, telephonyRxInMix));
+         c.routes.push_back(createRoute({telephonyTxOutMix}, telephonyTxOutDevice));
+         c.routes.push_back(createRoute({fmTunerInDevice}, fmTunerInMix));
+diff -ruN a/audio/aidl/default/include/core-impl/ModulePrimary.h b/audio/aidl/default/include/core-impl/ModulePrimary.h
+--- a/audio/aidl/default/include/core-impl/ModulePrimary.h	2026-11-17 16:41:20.520252031 +0100
++++ b/audio/aidl/default/include/core-impl/ModulePrimary.h	2026-11-17 16:41:51.988207847 +0100
+@@ -47,6 +47,9 @@
+             int32_t bufferSizeFrames, int32_t frameSizeBytes, MmapBufferDescriptor* desc) override;
+     int32_t getNominalLatencyMs(
+             const ::aidl::android::media::audio::common::AudioPortConfig& portConfig) override;
++    ndk::ScopedAStatus populateConnectedDevicePort(
++            ::aidl::android::media::audio::common::AudioPort* audioPort,
++            int32_t nextPortId) override;
+ 
+   private:
+     ChildInterface<ITelephony> mTelephony;
+diff -ruN a/audio/aidl/default/ModulePrimary.cpp b/audio/aidl/default/ModulePrimary.cpp
+--- a/audio/aidl/default/ModulePrimary.cpp	2026-11-17 16:41:19.663263426 +0100
++++ b/audio/aidl/default/ModulePrimary.cpp	2026-11-17 16:41:51.988276571 +0100
+@@ -120,6 +120,21 @@
+     return ndk::ScopedAStatus::ok();
+ }
+ 
++// mothershipOS: wired (analog jack) devices are connected by the framework; their streams use the
++// mix ports' static profiles, the PCM is chosen by device type (StreamPrimary).
++ndk::ScopedAStatus ModulePrimary::populateConnectedDevicePort(AudioPort* audioPort, int32_t) {
++    if (audioPort->ext.getTag() != AudioPortExt::device) {
++        return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
++    }
++    const auto& connection = audioPort->ext.get<AudioPortExt::device>().device.type.connection;
++    if (!connection.empty() &&
++        connection != ::aidl::android::media::audio::common::AudioDeviceDescription::CONNECTION_ANALOG) {
++        LOG(ERROR) << __func__ << ": unsupported connection: " << audioPort->toString();
++        return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
++    }
++    return ndk::ScopedAStatus::ok();
++}
++
+ int32_t ModulePrimary::getNominalLatencyMs(const AudioPortConfig& portConfig) {
+     static constexpr int32_t kLowLatencyMs = 10;
+     // 85 ms is chosen considering 4096 frames @ 48 kHz. This is the value which allows
+diff -ruN a/audio/aidl/default/primary/StreamPrimary.cpp b/audio/aidl/default/primary/StreamPrimary.cpp
+--- a/audio/aidl/default/primary/StreamPrimary.cpp	2026-11-17 16:41:20.066258068 +0100
++++ b/audio/aidl/default/primary/StreamPrimary.cpp	2026-11-17 22:48:52.319210748 +0100
+@@ -17,6 +17,7 @@
+ #define LOG_TAG "AHAL_StreamPrimary"
+ 
+ #include <cstdio>
++#include <unistd.h>
+ 
+ #include <android-base/logging.h>
+ #include <android-base/parseint.h>
+@@ -96,6 +97,29 @@
+     if (isStubStreamOnWorker()) {
+         return mStubDriver.transfer(buffer, frameCount, actualFrameCount, latencyMs);
+     }
++    // mothershipOS (mship.audio): a routing change while the stream runs (Android moving media from the wired
++    // headset to the speaker, a call to the earpiece) moves it to the new device's PCM at once; otherwise it took
++    // effect only at the next start, after a standby (setConnectedDevices only records the device).
++    {
++        AlsaDeviceId next;
++        {
++            std::lock_guard l(mLock);
++            next = mAlsaDeviceId;
++        }
++        if (next != mCurrAlsaDeviceId && next != kStubDeviceId) {
++            LOG(DEBUG) << __func__ << ": device changed to card " << next.first << " device "
++                       << next.second << ", reopening";
++            StreamAlsa::shutdown();
++            {
++                std::lock_guard l(mLock);
++                mCurrAlsaDeviceId = next;
++            }
++            RETURN_STATUS_IF_ERROR(StreamAlsa::start());
++            mStartTimeNs = ::android::uptimeNanos();
++            mFramesSinceStart = 0;
++            mSkipNextTransfer = false;
++        }
++    }
+     // This is a workaround for the emulator implementation which has a host-side buffer
+     // and is not being able to achieve real-time behavior similar to ADSPs (b/302587331).
+     if (!mSkipNextTransfer) {
+@@ -176,20 +200,45 @@
+ // static
+ StreamPrimary::AlsaDeviceId StreamPrimary::getCardAndDeviceId(
+         const std::vector<AudioDevice>& devices) {
+-    if (devices.empty() || devices[0].address.getTag() != AudioDeviceAddress::id) {
++    if (devices.empty()) {
+         return kDefaultCardAndDeviceId;
+     }
+-    std::string deviceAddress = devices[0].address.get<AudioDeviceAddress::id>();
+-    AlsaDeviceId cardAndDeviceId;
+-    if (const size_t suffixPos = deviceAddress.rfind("CARD_");
+-        suffixPos == std::string::npos ||
+-        sscanf(deviceAddress.c_str() + suffixPos, "CARD_%d_DEV_%d", &cardAndDeviceId.first,
+-               &cardAndDeviceId.second) != 2) {
+-        return kDefaultCardAndDeviceId;
++    if (devices[0].address.getTag() == AudioDeviceAddress::id) {
++        std::string deviceAddress = devices[0].address.get<AudioDeviceAddress::id>();
++        AlsaDeviceId cardAndDeviceId;
++        if (const size_t suffixPos = deviceAddress.rfind("CARD_");
++            suffixPos != std::string::npos &&
++            sscanf(deviceAddress.c_str() + suffixPos, "CARD_%d_DEV_%d", &cardAndDeviceId.first,
++                   &cardAndDeviceId.second) == 2) {
++            LOG(DEBUG) << __func__ << ": parsed with card id " << cardAndDeviceId.first
++                       << ", device id " << cardAndDeviceId.second;
++            return cardAndDeviceId;
++        }
++    }
++    // mothershipOS (mship.audio): one PCM per phone audio device on the default card, by device
++    // type (wired devices have no address); a card without that PCM uses the default one.
++    int pcm = -1;
++    bool input = false;
++    switch (devices[0].type.type) {
++        case AudioDeviceType::OUT_SPEAKER: pcm = 0; break;
++        case AudioDeviceType::OUT_SPEAKER_EARPIECE: pcm = 1; break;
++        case AudioDeviceType::OUT_HEADSET:
++        case AudioDeviceType::OUT_HEADPHONE: pcm = 2; break;
++        case AudioDeviceType::IN_MICROPHONE: pcm = 3; input = true; break;
++        case AudioDeviceType::IN_MICROPHONE_BACK: pcm = 4; input = true; break;
++        case AudioDeviceType::IN_HEADSET: pcm = 5; input = true; break;
++        default: break;
++    }
++    if (pcm >= 0) {
++        const int card = kDefaultCardAndDeviceId.first;
++        const std::string node = "/dev/snd/pcmC" + std::to_string(card) + "D" +
++                                 std::to_string(pcm) + (input ? "c" : "p");
++        if (access(node.c_str(), F_OK) == 0) {
++            LOG(DEBUG) << __func__ << ": " << devices[0].toString() << " -> " << node;
++            return {card, pcm};
++        }
+     }
+-    LOG(DEBUG) << __func__ << ": parsed with card id " << cardAndDeviceId.first << ", device id "
+-               << cardAndDeviceId.second;
+-    return cardAndDeviceId;
++    return kDefaultCardAndDeviceId;
+ }
+ 
+ // static

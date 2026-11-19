@@ -1,0 +1,55 @@
+mothershipOS (mship.audio): the primary module's policy configuration lists the phone's audio
+devices the HAL has (hardware/interfaces 0002): earpiece and back mic attached, wired headset,
+headphones and headset mic connectable, all routed from/to the primary mix ports.
+
+diff -ruN a/shared/config/audio/policy/primary_audio_policy_configuration.xml b/shared/config/audio/policy/primary_audio_policy_configuration.xml
+--- a/shared/config/audio/policy/primary_audio_policy_configuration.xml	2026-11-17 16:41:21.017245423 +0100
++++ b/shared/config/audio/policy/primary_audio_policy_configuration.xml	2026-11-17 16:42:17.100387553 +0100
+@@ -18,7 +18,9 @@
+ <module name="primary" halVersion="3.0">
+     <attachedDevices>
+         <item>Speaker</item>
++        <item>Earpiece</item>
+         <item>Built-In Mic</item>
++        <item>Built-In Back Mic</item>
+         <item>Telephony Tx</item>
+         <item>Telephony Rx</item>
+         <item>FM Tuner</item>
+@@ -71,11 +73,21 @@
+    <devicePorts>
+         <devicePort tagName="Speaker" type="AUDIO_DEVICE_OUT_SPEAKER" role="sink">
+         </devicePort>
++        <devicePort tagName="Earpiece" type="AUDIO_DEVICE_OUT_EARPIECE" role="sink">
++        </devicePort>
++        <devicePort tagName="Wired Headset" type="AUDIO_DEVICE_OUT_WIRED_HEADSET" role="sink">
++        </devicePort>
++        <devicePort tagName="Wired Headphones" type="AUDIO_DEVICE_OUT_WIRED_HEADPHONE" role="sink">
++        </devicePort>
+         <devicePort tagName="Telephony Tx" type="AUDIO_DEVICE_OUT_TELEPHONY_TX" role="sink">
+         </devicePort>
+ 
+         <devicePort tagName="Built-In Mic" type="AUDIO_DEVICE_IN_BUILTIN_MIC" address="bottom" role="source">
+         </devicePort>
++        <devicePort tagName="Built-In Back Mic" type="AUDIO_DEVICE_IN_BACK_MIC" address="back" role="source">
++        </devicePort>
++        <devicePort tagName="Wired Headset Mic" type="AUDIO_DEVICE_IN_WIRED_HEADSET" role="source">
++        </devicePort>
+         <devicePort tagName="Telephony Rx" type="AUDIO_DEVICE_IN_TELEPHONY_RX" role="source">
+         </devicePort>
+ 
+@@ -85,8 +97,14 @@
+     <routes>
+         <route type="mix" sink="Speaker"
+                sources="primary output,compressed_offload,mmap_no_irq_out"/>
++        <route type="mix" sink="Earpiece"
++               sources="primary output"/>
++        <route type="mix" sink="Wired Headset"
++               sources="primary output"/>
++        <route type="mix" sink="Wired Headphones"
++               sources="primary output"/>
+         <route type="mix" sink="primary input"
+-               sources="Built-In Mic"/>
++               sources="Built-In Mic,Built-In Back Mic,Wired Headset Mic"/>
+         <route type="mix" sink="mmap_no_irq_in"
+                sources="Built-In Mic"/>
+ 

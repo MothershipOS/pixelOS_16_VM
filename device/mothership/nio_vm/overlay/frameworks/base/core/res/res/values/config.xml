@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- mothershipOS: framework settings for the nio VM -->
+<resources>
+    <!-- mship.audio: the headset jack comes as input switches (SW_HEADPHONE_INSERT, SW_MICROPHONE_INSERT) of a
+         virtio-input switches device (the virtio-snd jacks are phantom jacks without one); WiredAccessoryManager then
+         connects the wired headset / headphones and headset mic -->
+    <bool name="config_useDevInputEventForAudioJack">true</bool>
+
+    <!-- The nio panel runs at 90 Hz only. The framework default (60) capped rendering at 60 Hz, which on a 90 Hz
+         display means 45 fps (the nearest divisor): every app and animation ran at half the panel's rate. -->
+    <integer name="config_defaultRefreshRate">90</integer>
+    <integer name="config_defaultPeakRefreshRate">90</integer>
+</resources>

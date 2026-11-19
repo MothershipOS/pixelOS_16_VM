@@ -1,0 +1,33 @@
+mothershipOS (mship display): SurfaceFlinger with the sync framework and present fences. The
+ranchu HWC's present fences are real (device/generic/goldfish 0001), so SurfaceFlinger no longer runs
+without the sync framework (hardware vsync forced on) or ignores present fences.
+
+diff -ruN a/shared/config/graphics/init_graphics.vendor.rc b/shared/config/graphics/init_graphics.vendor.rc
+--- a/shared/config/graphics/init_graphics.vendor.rc	2026-11-18 05:09:54.721198232 +0000
++++ b/shared/config/graphics/init_graphics.vendor.rc	2026-11-18 05:09:54.738198684 +0000
+@@ -3,7 +3,6 @@
+ 
+     setprop ro.sf.lcd_density ${ro.boot.lcd_density}
+     setprop ro.hardware.egl ${ro.boot.hardware.egl}
+-    setprop debug.sf.vsync_reactor_ignore_present_fences true
+     setprop ro.hardware.gralloc ${ro.boot.hardware.gralloc}
+     setprop ro.hardware.hwcomposer ${ro.boot.hardware.hwcomposer}
+     setprop ro.vendor.hwcomposer.display_finder_mode ${ro.boot.hardware.hwcomposer.display_finder_mode}
+diff -ruN a/shared/device.mk b/shared/device.mk
+--- a/shared/device.mk	2026-11-18 05:09:54.718198153 +0000
++++ b/shared/device.mk	2026-11-18 05:09:54.737198657 +0000
+@@ -540,10 +540,11 @@
+ #for Confirmation UI
+ PRODUCT_SOONG_NAMESPACES += vendor/google_devices/common/proprietary/confirmatioui_hal
+ 
+-# Need this so that the application's loop on reading input can be synchronized
+-# with HW VSYNC
++# mothershipOS: the present fences are real (the guest virtio-gpu fences every primary flush, the
++# HWC phase-locks its vsync to them): SurfaceFlinger runs with the sync framework, its vsync model
++# follows the host panel and hardware vsync is off while the model holds
+ PRODUCT_VENDOR_PROPERTIES += \
+-    ro.surface_flinger.running_without_sync_framework=true
++    ro.surface_flinger.running_without_sync_framework=false
+ 
+ # Enable GPU-intensive background blur support on Cuttlefish when requested by apps
+ PRODUCT_VENDOR_PROPERTIES += \
