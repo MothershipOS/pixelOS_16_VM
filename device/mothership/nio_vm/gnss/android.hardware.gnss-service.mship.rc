@@ -1,0 +1,4 @@
+service vendor.gnss-mship /vendor/bin/hw/android.hardware.gnss-service.mship
+    class hal
+    user gps
+    group system

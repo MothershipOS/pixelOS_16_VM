@@ -1,0 +1,330 @@
+mothershipOS: the external camera HAL drives a mothershipOS host camera's focus and light through the device's standard
+V4L2 controls (FOCUS_AUTO, FOCUS_ABSOLUTE, AUTO_FOCUS_START/STATUS, FLASH_LED_MODE; mship.camera): AF modes off
+(manual focus distance), auto (triggered) and continuous with the host's real AF state, flash for captures,
+torch (setTorchMode). A device without these controls keeps the stock fixed-focus, no-flash behaviour.
+
+diff -ru a/camera/device/default/ExternalCameraDevice.cpp b/camera/device/default/ExternalCameraDevice.cpp
+--- a/camera/device/default/ExternalCameraDevice.cpp	2026-11-19 21:08:24.836572398 +0000
++++ b/camera/device/default/ExternalCameraDevice.cpp	2026-11-19 21:08:24.866573206 +0000
+@@ -56,6 +56,54 @@
+     ALOGI("%s: facing %s, orientation %d", __FUNCTION__, facing == ANDROID_LENS_FACING_FRONT ? "front" : "back", c.value);
+ }
+ 
++// mothershipOS: whether a device control is real (present, not inactive/disabled)
++bool hostControl(int fd, uint32_t id) {
++    v4l2_queryctrl q{.id = id};
++    return ioctl(fd, VIDIOC_QUERYCTRL, &q) == 0 &&
++           !(q.flags & (V4L2_CTRL_FLAG_DISABLED | V4L2_CTRL_FLAG_INACTIVE));
++}
++
++// mothershipOS: append keys to a characteristics key list (request, result or characteristics keys)
++void appendKeys(::android::hardware::camera::common::V1_0::helper::CameraMetadata* m, uint32_t list,
++                std::initializer_list<int32_t> keys) {
++    camera_metadata_entry e = m->find(list);
++    std::vector<int32_t> v(e.data.i32, e.data.i32 + e.count);
++    v.insert(v.end(), keys.begin(), keys.end());
++    m->update(list, v.data(), v.size());
++}
++
++// mothershipOS: focus and light of a mothershipOS host's camera (its standard V4L2 focus and flash controls,
++// carried out by the host: lens actuator, autofocus, flash LEDs). A device without them keeps the fixed-focus,
++// no-flash characteristics.
++void updateHostControls(int fd, ::android::hardware::camera::common::V1_0::helper::CameraMetadata* m) {
++    if (hostControl(fd, V4L2_CID_FOCUS_AUTO)) {
++        const uint8_t afModes[] = {ANDROID_CONTROL_AF_MODE_OFF, ANDROID_CONTROL_AF_MODE_AUTO,
++                                   ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO,
++                                   ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE};
++        m->update(ANDROID_CONTROL_AF_AVAILABLE_MODES, afModes, sizeof(afModes));
++        const float minFocus = kHostMinFocusDiopters;
++        m->update(ANDROID_LENS_INFO_MINIMUM_FOCUS_DISTANCE, &minFocus, 1);
++        appendKeys(m, ANDROID_REQUEST_AVAILABLE_REQUEST_KEYS, {ANDROID_LENS_FOCUS_DISTANCE});
++        appendKeys(m, ANDROID_REQUEST_AVAILABLE_RESULT_KEYS, {ANDROID_LENS_FOCUS_DISTANCE, ANDROID_LENS_STATE});
++        appendKeys(m, ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS, {ANDROID_LENS_INFO_MINIMUM_FOCUS_DISTANCE});
++        // one AF region: camera apps offer tap to focus only with one (the host focuses on the frame's centre)
++        camera_metadata_entry r = m->find(ANDROID_CONTROL_MAX_REGIONS);
++        if (r.count == 3) {
++            const int32_t regions[3] = {r.data.i32[0], r.data.i32[1], 1};
++            m->update(ANDROID_CONTROL_MAX_REGIONS, regions, 3);
++        }
++        ALOGI("%s: focus control (manual, auto, continuous)", __FUNCTION__);
++    }
++    if (hostControl(fd, V4L2_CID_FLASH_LED_MODE)) {
++        const uint8_t flash = ANDROID_FLASH_INFO_AVAILABLE_TRUE;
++        m->update(ANDROID_FLASH_INFO_AVAILABLE, &flash, 1);
++        const uint8_t aeModes[] = {ANDROID_CONTROL_AE_MODE_ON, ANDROID_CONTROL_AE_MODE_ON_AUTO_FLASH,
++                                   ANDROID_CONTROL_AE_MODE_ON_ALWAYS_FLASH};
++        m->update(ANDROID_CONTROL_AE_AVAILABLE_MODES, aeModes, sizeof(aeModes));
++        ALOGI("%s: flash and torch", __FUNCTION__);
++    }
++}
++
+ // Only support MJPEG for now as it seems to be the one supports higher fps
+ // Other formats to consider in the future:
+ // * V4L2_PIX_FMT_YVU420 (== YV12)
+@@ -191,8 +239,18 @@
+     return fromStatus(Status::OPERATION_NOT_SUPPORTED);
+ }
+ 
+-ndk::ScopedAStatus ExternalCameraDevice::setTorchMode(bool) {
+-    return fromStatus(Status::OPERATION_NOT_SUPPORTED);
++ndk::ScopedAStatus ExternalCameraDevice::setTorchMode(bool on) {
++    // mothershipOS: the host's flash LED as a torch (V4L2_CID_FLASH_LED_MODE)
++    unique_fd fd(::open(mDevicePath.c_str(), O_RDWR));
++    if (fd.get() < 0 || !hostControl(fd.get(), V4L2_CID_FLASH_LED_MODE)) {
++        return fromStatus(Status::OPERATION_NOT_SUPPORTED);
++    }
++    v4l2_control c{.id = V4L2_CID_FLASH_LED_MODE,
++                   .value = on ? V4L2_FLASH_LED_MODE_TORCH : V4L2_FLASH_LED_MODE_NONE};
++    if (ioctl(fd.get(), VIDIOC_S_CTRL, &c) != 0) {
++        return fromStatus(Status::INTERNAL_ERROR);
++    }
++    return fromStatus(Status::OK);
+ }
+ 
+ ndk::ScopedAStatus ExternalCameraDevice::turnOnTorchWithStrengthLevel(int32_t) {
+@@ -321,6 +379,7 @@
+     }
+ 
+     updatePlacement(fd.get(), &mCameraCharacteristics);
++    updateHostControls(fd.get(), &mCameraCharacteristics);
+ 
+     ret = initAvailableCapabilities(&mCameraCharacteristics);
+     if (ret != OK) {
+diff -ru a/camera/device/default/ExternalCameraDeviceSession.cpp b/camera/device/default/ExternalCameraDeviceSession.cpp
+--- a/camera/device/default/ExternalCameraDeviceSession.cpp	2026-11-19 21:08:24.840572506 +0000
++++ b/camera/device/default/ExternalCameraDeviceSession.cpp	2026-11-19 21:08:24.870573313 +0000
+@@ -592,6 +592,8 @@
+         return Status::ILLEGAL_ARGUMENT;
+     }
+ 
++    applyHostControls(mLatestReqSetting);
++
+     camera_metadata_entry fpsRange = mLatestReqSetting.find(ANDROID_CONTROL_AE_TARGET_FPS_RANGE);
+     if (fpsRange.count == 2) {
+         double requestFpsMax = fpsRange.data.i32[1];
+@@ -898,6 +900,15 @@
+     } while (0)
+ 
+ status_t ExternalCameraDeviceSession::initDefaultRequests() {
++    // mothershipOS: the host camera's focus and light (from the characteristics the device built)
++    {
++        camera_metadata_ro_entry af = mCameraCharacteristics.find(ANDROID_CONTROL_AF_AVAILABLE_MODES);
++        for (size_t i = 0; i < af.count; i++) {
++            mHostFocus |= af.data.u8[i] == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE;
++        }
++        camera_metadata_ro_entry fl = mCameraCharacteristics.find(ANDROID_FLASH_INFO_AVAILABLE);
++        mHostFlash = fl.count && fl.data.u8[0] == ANDROID_FLASH_INFO_AVAILABLE_TRUE;
++    }
+     common::V1_0::helper::CameraMetadata md;
+ 
+     const uint8_t aberrationMode = ANDROID_COLOR_CORRECTION_ABERRATION_MODE_OFF;
+@@ -1007,6 +1018,13 @@
+                 continue;
+         }
+         UPDATE(mdCopy, ANDROID_CONTROL_CAPTURE_INTENT, &intent, 1);
++        if (mHostFocus) {
++            const uint8_t afMode = (type == RequestTemplate::VIDEO_RECORD ||
++                                    type == RequestTemplate::VIDEO_SNAPSHOT)
++                                           ? ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO
++                                           : ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE;
++            UPDATE(mdCopy, ANDROID_CONTROL_AF_MODE, &afMode, 1);
++        }
+         camera_metadata_t* mdPtr = mdCopy.release();
+         uint8_t* rawMd = reinterpret_cast<uint8_t*>(mdPtr);
+         CameraMetadata aidlMd;
+@@ -1017,6 +1035,84 @@
+     return OK;
+ }
+ 
++// mothershipOS: set a host camera control when its value changes
++void ExternalCameraDeviceSession::setHostControl(uint32_t id, int value, int* cache) {
++    if (*cache == value) return;
++    v4l2_control c{.id = id, .value = value};
++    if (ioctl(mV4l2Fd.get(), VIDIOC_S_CTRL, &c) == 0) {
++        *cache = value;
++    } else {
++        ALOGW("%s: control 0x%x = %d: %s", __FUNCTION__, id, value, strerror(errno));
++    }
++}
++
++static uint8_t settingU8(const common::V1_0::helper::CameraMetadata& s, uint32_t tag, uint8_t def) {
++    camera_metadata_ro_entry e = s.find(tag);
++    return e.count ? e.data.u8[0] : def;
++}
++
++// mothershipOS: a request's focus and flash settings to the host camera's controls
++void ExternalCameraDeviceSession::applyHostControls(const common::V1_0::helper::CameraMetadata& s) {
++    std::lock_guard<std::mutex> lk(mAfTriggerLock);
++    if (mHostFocus) {
++        uint8_t mode = settingU8(s, ANDROID_CONTROL_AF_MODE, ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE);
++        uint8_t trigger = settingU8(s, ANDROID_CONTROL_AF_TRIGGER, ANDROID_CONTROL_AF_TRIGGER_IDLE);
++        bool continuous = mode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE ||
++                          mode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO;
++        if (mode != mAfMode) {
++            mAfMode = mode;
++            mAfLocked = mAfRun = false;
++        }
++        bool start = false;
++        if (trigger == ANDROID_CONTROL_AF_TRIGGER_START) {
++            if (continuous) {
++                mAfLocked = true;
++            } else if (mode == ANDROID_CONTROL_AF_MODE_AUTO) {
++                mAfRun = start = true;
++            }
++        } else if (trigger == ANDROID_CONTROL_AF_TRIGGER_CANCEL) {
++            mAfLocked = mAfRun = false;
++        }
++        setHostControl(V4L2_CID_FOCUS_AUTO, continuous && !mAfLocked ? 1 : 0, &mFocusAuto);
++        if (mode == ANDROID_CONTROL_AF_MODE_OFF) {
++            camera_metadata_ro_entry d = s.find(ANDROID_LENS_FOCUS_DISTANCE);
++            float diopters = d.count ? d.data.f[0] : 0.0f;
++            int pos = static_cast<int>(diopters / kHostMinFocusDiopters * 1023.0f + 0.5f);
++            setHostControl(V4L2_CID_FOCUS_ABSOLUTE, std::clamp(pos, 0, 1023), &mFocusPos);
++        } else {
++            mFocusPos = -1;
++        }
++        if (start) {
++            // busy until the host reports the run's end
++            v4l2_control c{.id = V4L2_CID_AUTO_FOCUS_STATUS, .value = V4L2_AUTO_FOCUS_STATUS_BUSY};
++            ioctl(mV4l2Fd.get(), VIDIOC_S_CTRL, &c);
++            c = {.id = V4L2_CID_AUTO_FOCUS_START, .value = 0};
++            ioctl(mV4l2Fd.get(), VIDIOC_S_CTRL, &c);
++        }
++    }
++    if (mHostFlash) {
++        uint8_t flash = settingU8(s, ANDROID_FLASH_MODE, ANDROID_FLASH_MODE_OFF);
++        uint8_t ae = settingU8(s, ANDROID_CONTROL_AE_MODE, ANDROID_CONTROL_AE_MODE_ON);
++        uint8_t pre = settingU8(s, ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER,
++                                ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_IDLE);
++        uint8_t intent = settingU8(s, ANDROID_CONTROL_CAPTURE_INTENT, ANDROID_CONTROL_CAPTURE_INTENT_PREVIEW);
++        // the host has no light measurement for the decision: auto flash fires like always flash
++        bool flashAe = ae == ANDROID_CONTROL_AE_MODE_ON_ALWAYS_FLASH ||
++                       ae == ANDROID_CONTROL_AE_MODE_ON_AUTO_FLASH;
++        if (flashAe && pre == ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_START) {
++            mFlashHold = 90;  // until the capture comes (up to ~3 s)
++        } else if (intent == ANDROID_CONTROL_CAPTURE_INTENT_STILL_CAPTURE &&
++                   (flashAe || flash == ANDROID_FLASH_MODE_SINGLE)) {
++            mFlashHold = std::max(std::min(mFlashHold, 10), 10);  // the capture, and a few frames after
++        } else if (mFlashHold > 0) {
++            mFlashHold--;
++        }
++        bool on = flash == ANDROID_FLASH_MODE_TORCH || mFlashHold > 0;
++        setHostControl(V4L2_CID_FLASH_LED_MODE, on ? V4L2_FLASH_LED_MODE_TORCH : V4L2_FLASH_LED_MODE_NONE,
++                       &mLed);
++    }
++}
++
+ status_t ExternalCameraDeviceSession::fillCaptureResult(common::V1_0::helper::CameraMetadata& md,
+                                                         nsecs_t timestamp) {
+     bool afTrigger = false;
+@@ -1042,12 +1138,61 @@
+     } else {
+         afState = ANDROID_CONTROL_AF_STATE_INACTIVE;
+     }
++    // mothershipOS: a host camera's focus: the state its autofocus reports
++    uint8_t lensState = ANDROID_LENS_STATE_STATIONARY;
++    if (mHostFocus) {
++        uint8_t mode = settingU8(md, ANDROID_CONTROL_AF_MODE, ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE);
++        v4l2_control c{.id = V4L2_CID_AUTO_FOCUS_STATUS};
++        int st = ioctl(mV4l2Fd.get(), VIDIOC_G_CTRL, &c) == 0 ? c.value : 0;
++        bool locked, run;
++        {
++            std::lock_guard<std::mutex> lk(mAfTriggerLock);
++            locked = mAfLocked;
++            run = mAfRun;
++        }
++        bool busy = st & V4L2_AUTO_FOCUS_STATUS_BUSY;
++        bool reached = st & V4L2_AUTO_FOCUS_STATUS_REACHED;
++        bool failed = st & V4L2_AUTO_FOCUS_STATUS_FAILED;
++        if (busy) lensState = ANDROID_LENS_STATE_MOVING;
++        switch (mode) {
++            case ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE:
++            case ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO:
++                afState = locked ? (reached ? ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED
++                                            : ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED)
++                        : busy    ? ANDROID_CONTROL_AF_STATE_PASSIVE_SCAN
++                        : reached ? ANDROID_CONTROL_AF_STATE_PASSIVE_FOCUSED
++                        : failed  ? ANDROID_CONTROL_AF_STATE_PASSIVE_UNFOCUSED
++                                  : ANDROID_CONTROL_AF_STATE_INACTIVE;
++                break;
++            case ANDROID_CONTROL_AF_MODE_AUTO:
++                afState = !run    ? ANDROID_CONTROL_AF_STATE_INACTIVE
++                        : busy    ? ANDROID_CONTROL_AF_STATE_ACTIVE_SCAN
++                        : reached ? ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED
++                        : failed  ? ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED
++                                  : ANDROID_CONTROL_AF_STATE_ACTIVE_SCAN;
++                break;
++            default:
++                afState = ANDROID_CONTROL_AF_STATE_INACTIVE;
++        }
++        UPDATE(md, ANDROID_LENS_STATE, &lensState, 1);
++    }
+     UPDATE(md, ANDROID_CONTROL_AF_STATE, &afState, 1);
+ 
+     camera_metadata_ro_entry activeArraySize =
+             mCameraCharacteristics.find(ANDROID_SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+ 
+-    return fillCaptureResultCommon(md, timestamp, activeArraySize);
++    status_t ret = fillCaptureResultCommon(md, timestamp, activeArraySize);
++    if (ret == OK && mHostFlash) {
++        int led;
++        {
++            std::lock_guard<std::mutex> lk(mAfTriggerLock);
++            led = mLed;
++        }
++        const uint8_t flashState = led == V4L2_FLASH_LED_MODE_TORCH ? ANDROID_FLASH_STATE_FIRED
++                                                                   : ANDROID_FLASH_STATE_READY;
++        UPDATE(md, ANDROID_FLASH_STATE, &flashState, 1);
++    }
++    return ret;
+ }
+ 
+ int ExternalCameraDeviceSession::configureV4l2StreamLocked(const SupportedV4L2Format& v4l2Fmt,
+@@ -1415,6 +1560,11 @@
+     Mutex::Autolock _il(mInterfaceLock);
+     bool closed = isClosed();
+     if (!closed) {
++        // mothershipOS: the light goes off with the session (the torch is the device's setTorchMode)
++        if (mHostFlash) {
++            std::lock_guard<std::mutex> lk(mAfTriggerLock);
++            setHostControl(V4L2_CID_FLASH_LED_MODE, V4L2_FLASH_LED_MODE_NONE, &mLed);
++        }
+         closeOutputThread();
+         closeBufferRequestThread();
+ 
+diff -ru a/camera/device/default/ExternalCameraDeviceSession.h b/camera/device/default/ExternalCameraDeviceSession.h
+--- a/camera/device/default/ExternalCameraDeviceSession.h	2026-11-19 21:08:24.844572614 +0000
++++ b/camera/device/default/ExternalCameraDeviceSession.h	2026-11-19 21:08:24.867573233 +0000
+@@ -356,6 +356,18 @@
+     std::mutex mAfTriggerLock;  // protect mAfTrigger
+     bool mAfTrigger = false;
+ 
++    // mothershipOS: focus and light of a mothershipOS host's camera, carried out by the host through V4L2
++    // controls (protected by mAfTriggerLock)
++    bool mHostFocus = false;
++    bool mHostFlash = false;
++    uint8_t mAfMode = 0xff;
++    bool mAfLocked = false;   // continuous AF locked by a trigger
++    bool mAfRun = false;      // AUTO: a triggered run is going on or done
++    int mFocusAuto = -1, mFocusPos = -1, mLed = -1;
++    int mFlashHold = 0;       // requests left with the light on (flash captures)
++    void applyHostControls(const common::V1_0::helper::CameraMetadata& settings);
++    void setHostControl(uint32_t id, int value, int* cache);
++
+     uint32_t mBlobBufferSize = 0;
+ 
+     static HandleImporter sHandleImporter;
+diff -ru a/camera/device/default/ExternalCameraUtils.h b/camera/device/default/ExternalCameraUtils.h
+--- a/camera/device/default/ExternalCameraUtils.h	2026-11-19 21:08:24.848572721 +0000
++++ b/camera/device/default/ExternalCameraUtils.h	2026-11-19 21:08:24.866573206 +0000
+@@ -44,6 +44,10 @@
+ using ::android::hardware::graphics::mapper::V2_0::IMapper;
+ using ::android::hardware::graphics::mapper::V2_0::YCbCrLayout;
+ 
++// mothershipOS: the closest focus a host camera's lens range is mapped to (diopters: 1 / meters); the lens is
++// uncalibrated, so its range is spread linearly over 0 (infinity) .. this
++constexpr float kHostMinFocusDiopters = 10.0f;
++
+ namespace android {
+ namespace hardware {
+ namespace camera {

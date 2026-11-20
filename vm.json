@@ -76,6 +76,16 @@
       "contract": "mship.audio",
       "version": "1.0",
       "required": false
+    },
+    "gnss": {
+      "contract": "mship.gnss",
+      "version": "1.0",
+      "required": false
+    },
+    "sensors": {
+      "contract": "mship.sensors",
+      "version": "1.0",
+      "required": false
     }
   },
   "handover": {

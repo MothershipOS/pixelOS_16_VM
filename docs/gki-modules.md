@@ -1,7 +1,10 @@
 # Building guest kernel modules for a stock Android GKI kernel
 
-Guest drivers (mothershipOS's `guest/drivers`: `mship_wifi`, `virtio_media`, `virtio_gpu`) must load on the unmodified GKI kernel the guest image ships (PixelOS 16:
-`6.12.38-android16-5-g501f58f107ab-ab13974591-4k`). Done on the build machine (the buildfarm) in `~/mothership-build/gki`:
+**Works**: guest drivers (mothershipOS's `guest/drivers`: `mship_wifi`, `virtio_media`, `virtio_gpu`) built this
+way load on the unmodified GKI kernel the guest image ships (PixelOS 16:
+`6.12.38-android16-5-g501f58f107ab-ab13974591-4k`).
+
+Build machine: the buildfarm, in `~/mothership-build/gki`.
 
 1. Source: `kernel/common` branch `android16-6.12` at the commit in the kernel's version string (`501f58f10`);
    Cuttlefish's `kernel/common-modules/virtual-device` for the module fragments.

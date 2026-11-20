@@ -3,19 +3,28 @@
      Every /dev/video* with video capture is one; the video decoder (an M2M device) is skipped by the HAL itself. -->
 <ExternalCamera>
     <Provider>
-        <!-- must exist, even empty: without it the HAL stops reading here and keeps its default limits (720p at
-             7.5 fps, which drops every 30 fps camera) -->
+        <!-- must exist: without it the HAL stops reading here and keeps its default limits (720p at 7.5 fps, which
+             drops every 30 fps camera) -->
         <ignore/>
+        <!-- camera id = offset + N of /dev/videoN. The host's cameras follow the video decoder (video0) in the host's
+             order (back, front, front 2, back 2), so they become 0, 1, 2, 3 as on a phone: 0 the main back camera,
+             1 the main front one (camera apps such as Aperture take only 0 and 1 as main cameras) -->
+        <CameraIdOffset>-1</CameraIdOffset>
     </Provider>
     <Device>
-        <MaxJpegBufferSize bytes="3145728"/>
+        <!-- stills at the full sensor size (16 MP) -->
+        <MaxJpegBufferSize bytes="16777216"/>
         <NumVideoBuffers count="4"/>
         <NumStillBuffers count="2"/>
-        <!-- one value for every camera: the rear sensors' mounting (the front ones differ: a gap) -->
+        <!-- for a device without the standard camera controls (a mothershipOS host sets facing and sensor rotation
+             per camera: pixelOS_16_VM/patches/hardware/interfaces/0004) -->
         <Orientation degree="90"/>
+        <!-- the highest rate per size; sizes taller (wider) than the last limit are dropped. The device offers its own
+             modes (mship.camera: sizes and rates the host's pipeline sustains), these only bound them -->
         <FpsList>
-            <Limit width="1280" height="720" fpsBound="30.0"/>
-            <Limit width="1920" height="1080" fpsBound="30.0"/>
+            <Limit width="1920" height="1088" fpsBound="60.0"/>
+            <Limit width="3840" height="2160" fpsBound="30.0"/>
+            <Limit width="8192" height="6144" fpsBound="30.0"/>
         </FpsList>
     </Device>
 </ExternalCamera>

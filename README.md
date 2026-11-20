@@ -4,6 +4,15 @@ Android 16 (PixelOS, with Google apps) as a virtual machine on a phone running [
 a Cuttlefish arm64 product (`custom_nio_vm`) built from the PixelOS tree, booted by crosvm. It has no phone drivers:
 the phone's hardware reaches it through mothershipOS's contracts as generic virtual devices.
 
+- **Works**: GPU and display, touch and keys, Wi-Fi, telephony (no call audio), Bluetooth, battery, USB, audio,
+  hardware video decode, cameras (preview, photo, video in the camera app), GNSS (satellites and NMEA), sensors; every handle can be lent or taken while PixelOS runs.
+- **Needs work**: camera video at 1080p records at about 12 fps (software encoder), no camera controls; no GNSS position fix verified yet; sensors show
+  "Goldfish ..." names and fixed ranges.
+- **Broken**: Wi-Fi while the phone's QCA6390 firmware has crashed (host-side, until reboot).
+- **Not implemented**: call audio; step counter, significant motion, tilt and gesture sensors.
+
+Details: [docs/android-vm.md](docs/android-vm.md).
+
 | | |
 |---|---|
 | GPU | virtio-gpu DRM native context: Android's Mesa freedreno/turnip drives the host Adreno; zero-copy scanout |
@@ -11,6 +20,9 @@ the phone's hardware reaches it through mothershipOS's contracts as generic virt
 | Network | native Wi-Fi per band (`mship_wifi`), shared internet |
 | Telephony | Cuttlefish's RIL against the phone's real modem (`mship.modem`) |
 | Cameras | the external camera HAL, patched for mothershipOS's camera frames (`mship.camera`) |
+| Location | the phone's GNSS receiver (`mship.gnss`), our HAL on `/dev/gnss0` |
+| Sensors | the phone's sensors (`mship.sensors`) through Cuttlefish's goldfish sensors sub-HAL on hvc13 |
+| Audio | speaker, earpiece, headset, mics (`mship.audio`) through virtio-snd |
 | Also | Bluetooth, battery, USB, hardware video decode (virtio-media) |
 
 ## Contents
@@ -21,7 +33,7 @@ the phone's hardware reaches it through mothershipOS's contracts as generic virt
 | `mesa/` | Mesa for Android (pins, cross files; `cargo xtask android-mesa`) |
 | `vm.json` | the VM manifest mothershipOS runs it from |
 | `Dockerfile.build` | the build container for its guest modules |
-| `docs/android-vm.md` | how it is built, packaged and run; status and gaps |
+| `docs/android-vm.md` | status; how it is built, packaged and run |
 | `docs/gki-modules.md` | building guest kernel modules for the stock GKI kernel |
 | `crates/pixelos-install` | its install step on the phone: the disk from the package's images, or an update that keeps the user's data |
 | `crates/android-image` | Android image formats (sparse, GPT, boot images, bootconfig, LZ4 ramdisks, cpio) |

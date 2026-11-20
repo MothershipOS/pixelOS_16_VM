@@ -1,0 +1,127 @@
+mothershipOS (mship.video): the encoder takes frames that are virtio-gpu buffers in its layout as they are (DMABUF
+input). Before the input queue streams, the first frame decides its memory: one in Venus's layout (single-planar
+NV12, the device's strides and chroma offset; a mothershipOS host's NV12 gralloc buffers, e.g. the camera's video
+buffers) that is a virtio-gpu buffer (fdinfo exp_name) goes to the host's Venus where it is; other frames keep the
+MMAP copy of patch 0010. The bitstream stays MMAP.
+
+diff -ruN a/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h	2026-11-20 13:31:11.865964258 +0000
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h	2026-11-20 13:31:11.893965090 +0000
+@@ -123,6 +123,10 @@
+     // mothershipOS: MMAP buffers on both queues (frames and bitstream copied; ro.vendor.v4l2_codec2.encoder_mmap)
+     bool copyInputFrame(const InputFrame& frame, V4L2WritableBufferRef& buffer);
+     bool mMmap = true;
++    // mothershipOS: the input queue's memory (decided by the first frame: directInput), and whether a frame can
++    // go to the device as it is
++    bool mInputMmap = true;
++    bool directInput(const InputFrame& frame) const;
+     // Dequeue an input buffer the V4L2 device has finished encoding on the device input queue.
+     // Returns whether a buffer could be dequeued.
+     bool dequeueInputBuffer();
+diff -ruN a/v4l2/V4L2Encoder.cpp b/v4l2/V4L2Encoder.cpp
+--- a/v4l2/V4L2Encoder.cpp	2026-11-20 13:31:11.856963990 +0000
++++ b/v4l2/V4L2Encoder.cpp	2026-11-20 13:31:11.896965179 +0000
+@@ -25,6 +25,7 @@
+ #include <string.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <stdio.h>
+ #include <unistd.h>
+ #include <v4l2_codec2/v4l2/V4L2Device.h>
+ 
+@@ -761,6 +762,30 @@
+ 
+     ALOGV("%s(): queuing input buffer (index: %" PRId64 ")", __func__, index);
+ 
++    // mothershipOS: before the input queue streams, the first frame decides its memory: a virtio-gpu buffer in the
++    // device's layout (e.g. the camera's video buffers) goes to the device as it is (DMABUF: the host's encoder
++    // reads it where it is); else frames are copied into MMAP buffers
++    if (mMmap && !mInputQueue->isStreaming()) {
++        const bool direct = directInput(*frame);
++        if (direct == mInputMmap) {
++            mInputQueue->deallocateBuffers();
++            mInputBuffers.clear();
++            mInputMmap = !direct;
++            if (mInputQueue->allocateBuffers(kInputBufferCount,
++                                             mInputMmap ? V4L2_MEMORY_MMAP : V4L2_MEMORY_DMABUF) <
++                kInputBufferCount) {
++                ALOGE("Failed to create V4L2 input buffers.");
++                return false;
++            }
++            mInputBuffers.resize(mInputQueue->allocatedBuffersCount());
++        }
++        ALOGI("%s(): input frames %s", __func__,
++              direct ? "go to the device as they are (DMABUF)" : "are copied (MMAP)");
++    } else if (mMmap && !mInputMmap && !directInput(*frame)) {
++        ALOGE("%s(): a frame the device cannot take as it is, after DMABUF input started", __func__);
++        return false;
++    }
++
+     auto buffer = mInputQueue->getFreeBuffer();
+     if (!buffer) {
+         ALOGE("Failed to get free buffer from device input queue");
+@@ -774,7 +799,7 @@
+     size_t bufferId = buffer->bufferId();
+ 
+     // mothershipOS: the frame copied into the device's MMAP buffer (see copyInputFrame)
+-    if (mMmap) {
++    if (mMmap && mInputMmap) {
+         if (!copyInputFrame(*frame, *buffer) || !std::move(*buffer).queueMMap()) {
+             ALOGE("Failed to queue input buffer (MMAP)");
+             onError();
+@@ -904,6 +929,45 @@
+     return true;
+ }
+ 
++// mothershipOS: whether a frame can go to the device as it is: a virtio-gpu buffer (virtio-media can share only
++// those with the host) whose planes are where the device expects them (single-planar, its strides and offsets: a
++// mothershipOS host's NV12 gralloc buffers have the Venus layout). The first fd is the buffer (a gralloc handle has
++// one fd per plane, all of the same buffer).
++bool V4L2Encoder::directInput(const InputFrame& frame) const {
++    const auto& fds = frame.fds();
++    const auto& planes = frame.planes();
++    if (mInputLayout->mMultiPlanar || fds.empty() || planes.size() != mInputLayout->mPlanes.size()) {
++        ALOGI("%s(): no: multi-planar %d, %zu fds, %zu planes (device %zu)", __func__, mInputLayout->mMultiPlanar,
++              fds.size(), planes.size(), mInputLayout->mPlanes.size());
++        return false;
++    }
++    for (size_t i = 0; i < planes.size(); ++i) {
++        if (planes[i].mOffset != mInputLayout->mPlanes[i].mOffset ||
++            planes[i].mStride != mInputLayout->mPlanes[i].mStride) {
++            ALOGI("%s(): no: plane %zu at %u stride %u, the device's at %zu stride %zu", __func__, i,
++                  static_cast<uint32_t>(planes[i].mOffset), static_cast<uint32_t>(planes[i].mStride),
++                  static_cast<size_t>(mInputLayout->mPlanes[i].mOffset),
++                  static_cast<size_t>(mInputLayout->mPlanes[i].mStride));
++            return false;
++        }
++    }
++    char path[64];
++    snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fds[0]);
++    FILE* f = fopen(path, "re");
++    if (f == nullptr) return false;
++    char line[128];
++    bool virtio = false;
++    while (fgets(line, sizeof(line), f) != nullptr) {
++        if (strncmp(line, "exp_name:", 9) == 0) {
++            virtio = strstr(line, "virtio_gpu") != nullptr;
++            break;
++        }
++    }
++    fclose(f);
++    if (!virtio) ALOGI("%s(): no: not a virtio-gpu buffer", __func__);
++    return virtio;
++}
++
+ bool V4L2Encoder::enqueueOutputBuffer() {
+     ALOGV("%s()", __func__);
+     ALOG_ASSERT(mTaskRunner->RunsTasksInCurrentSequence());
+@@ -1117,7 +1181,8 @@
+     // No memory is allocated here, we just generate a list of buffers on the input queue, which
+     // will hold memory handles to the real buffers.
+     mMmap = property_get_bool("ro.vendor.v4l2_codec2.encoder_mmap", true);
+-    if (mInputQueue->allocateBuffers(kInputBufferCount, mMmap ? V4L2_MEMORY_MMAP : V4L2_MEMORY_DMABUF) <
++    mInputMmap = mMmap;
++    if (mInputQueue->allocateBuffers(kInputBufferCount, mInputMmap ? V4L2_MEMORY_MMAP : V4L2_MEMORY_DMABUF) <
+         kInputBufferCount) {
+         ALOGE("Failed to create V4L2 input buffers.");
+         return false;

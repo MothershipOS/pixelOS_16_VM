@@ -1,0 +1,1170 @@
+mothershipOS: zero-copy NV12 capture and the per-stream work on the GPU (ExternalCameraGpu: EGL/GLES3).
+A mothershipOS host offers NV12: the HAL allocates its own NV12 gralloc buffers, queues them as DMABUF (the host
+renders each frame into them; the device takes their layout: bytesperline and the "nv12 scanlines" control), and
+the GPU samples the capture buffer's planes (R8 / RG88 dma-buf images) to crop and scale them into each NV12/NV21
+output buffer. YU12 on the CPU (NV12ToI420) only for JPEG, planar or Y16 outputs, or when the GPU path fails.
+XBGR32 frames (MMAP): one upload, then crop + scale + BT.601 on the GPU. Properties:
+ro.vendor.camera.external.dmabuf=false (MMAP capture), ro.vendor.camera.external.gpu=false (XBGR32, CPU path).
+
+diff -ruN a/camera/device/default/Android.bp b/camera/device/default/Android.bp
+--- a/camera/device/default/Android.bp	2026-11-20 12:55:37.718519831 +0000
++++ b/camera/device/default/Android.bp	2026-11-20 12:55:37.778521510 +0000
+@@ -34,6 +34,7 @@
+     srcs: [
+         "ExternalCameraDevice.cpp",
+         "ExternalCameraDeviceSession.cpp",
++        "ExternalCameraGpu.cpp",
+         "ExternalCameraOfflineSession.cpp",
+         "ExternalCameraUtils.cpp",
+         "convert.cpp",
+@@ -50,7 +51,9 @@
+         "libbinder_ndk",
+         "libcamera_metadata",
+         "libcutils",
++        "libEGL",
+         "libexif",
++        "libGLESv2",
+         "libfmq",
+         "libgralloctypes",
+         "libhardware",
+@@ -69,6 +72,9 @@
+         "libaidlcommonsupport",
+     ],
+     header_libs: [
++        "libEGL_headers",
++        "libGLESv2_headers",
++        "libGLESv3_headers",
+         "media_plugin_headers",
+     ],
+     export_include_dirs: ["."],
+diff -ruN a/camera/device/default/ExternalCameraDevice.cpp b/camera/device/default/ExternalCameraDevice.cpp
+--- a/camera/device/default/ExternalCameraDevice.cpp	2026-11-20 12:55:37.730520167 +0000
++++ b/camera/device/default/ExternalCameraDevice.cpp	2026-11-20 12:55:37.803522210 +0000
+@@ -23,6 +23,8 @@
+ #include <aidl/android/hardware/camera/common/Status.h>
+ #include <convert.h>
+ #include <linux/videodev2.h>
++#include <algorithm>
++#include <cutils/properties.h>
+ #include <regex>
+ #include <set>
+ 
+@@ -108,9 +110,11 @@
+ // Other formats to consider in the future:
+ // * V4L2_PIX_FMT_YVU420 (== YV12)
+ // * V4L2_PIX_FMT_YVYU (YVYU: can be converted to YV12 or other YUV420_888 formats)
+-// mothershipOS: also V4L2_PIX_FMT_XBGR32 (B, G, R, X: libyuv ARGB), the frames a mothershipOS host gives its VMs
+-const std::array<uint32_t, /*size*/ 3> kSupportedFourCCs{
+-        {V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_Z16, V4L2_PIX_FMT_XBGR32}};  // double braces required in C++11
++// mothershipOS: also V4L2_PIX_FMT_XBGR32 (B, G, R, X: libyuv ARGB) and V4L2_PIX_FMT_NV12, the frames a mothershipOS
++// host gives its VMs (NV12: rendered into the HAL's own buffers)
++const std::array<uint32_t, /*size*/ 4> kSupportedFourCCs{
++        {V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_Z16, V4L2_PIX_FMT_XBGR32,
++         V4L2_PIX_FMT_NV12}};  // double braces required in C++11
+ 
+ constexpr int MAX_RETRY = 5;                  // Allow retry v4l2 open failures a few times.
+ constexpr int OPEN_RETRY_SLEEP_US = 100'000;  // 100ms * MAX_RETRY = 0.5 seconds
+@@ -417,6 +421,7 @@
+                 break;
+             case V4L2_PIX_FMT_MJPEG:
+             case V4L2_PIX_FMT_XBGR32:
++            case V4L2_PIX_FMT_NV12:
+                 hasColor = true;
+                 break;
+             default:
+@@ -737,8 +742,9 @@
+                 colorFourcc = V4L2_PIX_FMT_MJPEG;
+                 break;
+             case V4L2_PIX_FMT_XBGR32:
++            case V4L2_PIX_FMT_NV12:
+                 if (!hasColor) {
+-                    colorFourcc = V4L2_PIX_FMT_XBGR32;
++                    colorFourcc = supportedFormat.fourcc;
+                 }
+                 hasColor = true;
+                 break;
+@@ -1037,6 +1043,17 @@
+         }
+         fmtdesc.index++;
+     }
++    // mothershipOS: a mothershipOS host offers NV12 and XBGR32: NV12 with the GPU path (into our own buffers),
++    // else XBGR32
++    {
++        const bool nv12 = property_get_bool("ro.vendor.camera.external.gpu", true) &&
++                          std::any_of(outFmts.begin(), outFmts.end(),
++                                      [](const auto& f) { return f.fourcc == V4L2_PIX_FMT_NV12; });
++        const uint32_t drop = nv12 ? V4L2_PIX_FMT_XBGR32 : V4L2_PIX_FMT_NV12;
++        outFmts.erase(std::remove_if(outFmts.begin(), outFmts.end(),
++                                     [drop](const auto& f) { return f.fourcc == drop; }),
++                      outFmts.end());
++    }
+     trimSupportedFormats(cropType, &outFmts);
+     return outFmts;
+ }
+diff -ruN a/camera/device/default/ExternalCameraDeviceSession.cpp b/camera/device/default/ExternalCameraDeviceSession.cpp
+--- a/camera/device/default/ExternalCameraDeviceSession.cpp	2026-11-20 12:55:37.722519943 +0000
++++ b/camera/device/default/ExternalCameraDeviceSession.cpp	2026-11-20 12:55:37.817522601 +0000
+@@ -36,6 +36,11 @@
+ #include <convert.h>
+ #include <linux/videodev2.h>
+ #include <sync/sync.h>
++#include <sys/stat.h>
++#include <cutils/properties.h>
++#include "ExternalCameraGpu.h"
++#include <hardware/gralloc.h>
++#include <ui/GraphicBuffer.h>
+ #include <utils/Trace.h>
+ #include <deque>
+ 
+@@ -91,6 +96,8 @@
+ 
+ }  // anonymous namespace
+ 
++// mothershipOS: the AIDL PixelFormat (android::PixelFormat from ui/GraphicBuffer.h would hide it)
++using ::aidl::android::hardware::graphics::common::PixelFormat;
+ using ::aidl::android::hardware::camera::device::BufferRequestStatus;
+ using ::aidl::android::hardware::camera::device::CameraBlob;
+ using ::aidl::android::hardware::camera::device::CameraBlobId;
+@@ -1204,12 +1211,45 @@
+         return ret;
+     }
+ 
++    // mothershipOS: NV12 into our own gralloc buffers (DMABUF): the device takes their layout (luma stride; the
++    // chroma plane after the luma rows padded to a power of two: mothershipOS's "nv12 scanlines" control). Else
++    // MMAP. ro.vendor.camera.external.dmabuf=false: always MMAP.
++    constexpr uint32_t kScanlinesCid = V4L2_CID_USER_BASE | 0xf006;
++    mCaptureBuffers.clear();
++    mDmabufCapture = false;
++    uint32_t scanlines = 1;
++    if (v4l2Fmt.fourcc == V4L2_PIX_FMT_NV12) {
++        if (property_get_bool("ro.vendor.camera.external.dmabuf", true) &&
++            allocCaptureBuffersLocked(v4l2Fmt, 1) == 0 && mV4l2Stride > 0 &&
++            mV4l2ChromaOffset % mV4l2Stride == 0) {
++            const uint32_t rows = mV4l2ChromaOffset / mV4l2Stride;
++            while (scanlines <= 64 && ((v4l2Fmt.height + scanlines - 1) & ~(scanlines - 1)) != rows) {
++                scanlines <<= 1;
++            }
++            mDmabufCapture = scanlines <= 64;
++        }
++        if (!mDmabufCapture) {
++            ALOGW("%s: NV12 capture buffers of our own unavailable (stride %u, chroma at %u): MMAP", __FUNCTION__,
++                  mV4l2Stride, mV4l2ChromaOffset);
++            mCaptureBuffers.clear();
++            scanlines = 1;
++        }
++        v4l2_control ctrl{.id = kScanlinesCid, .value = static_cast<int32_t>(scanlines)};
++        if (ioctl(mV4l2Fd.get(), VIDIOC_S_CTRL, &ctrl) != 0 && scanlines != 1) {
++            ALOGW("%s: no scanlines control: MMAP", __FUNCTION__);
++            mDmabufCapture = false;
++            mCaptureBuffers.clear();
++            scanlines = 1;
++        }
++    }
++
+     // VIDIOC_S_FMT w/h/fmt
+-    v4l2_format fmt;
++    v4l2_format fmt{};
+     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+     fmt.fmt.pix.width = v4l2Fmt.width;
+     fmt.fmt.pix.height = v4l2Fmt.height;
+     fmt.fmt.pix.pixelformat = v4l2Fmt.fourcc;
++    fmt.fmt.pix.bytesperline = mDmabufCapture ? mV4l2Stride : 0;
+ 
+     {
+         int numAttempt = 0;
+@@ -1241,6 +1281,22 @@
+         return -EINVAL;
+     }
+ 
++    if (v4l2Fmt.fourcc == V4L2_PIX_FMT_NV12) {
++        const uint32_t rows = (v4l2Fmt.height + scanlines - 1) & ~(scanlines - 1);
++        if (mDmabufCapture && (fmt.fmt.pix.bytesperline != mV4l2Stride ||
++                               fmt.fmt.pix.bytesperline * rows != mV4l2ChromaOffset ||
++                               fmt.fmt.pix.sizeimage > mCaptureBuffers[0].length)) {
++            ALOGW("%s: the device does not take our buffers' layout (stride %u for %u, size %u): MMAP",
++                  __FUNCTION__, fmt.fmt.pix.bytesperline, mV4l2Stride, fmt.fmt.pix.sizeimage);
++            mDmabufCapture = false;
++            mCaptureBuffers.clear();
++        }
++        mV4l2Stride = fmt.fmt.pix.bytesperline;
++        mV4l2ChromaOffset = fmt.fmt.pix.bytesperline * rows;
++        ALOGI("%s: NV12 capture %s, stride %u, chroma at %u", __FUNCTION__,
++              mDmabufCapture ? "into our own buffers (DMABUF)" : "(MMAP)", mV4l2Stride, mV4l2ChromaOffset);
++    }
++
+     uint32_t bufferSize = fmt.fmt.pix.sizeimage;
+     ALOGI("%s: V4L2 buffer size is %d", __FUNCTION__, bufferSize);
+     uint32_t expectedMaxBufferSize = kMaxBytesPerPixel * fmt.fmt.pix.width * fmt.fmt.pix.height;
+@@ -1289,10 +1345,17 @@
+     ALOGI("%s: set mMaxLagNs to %" PRIu64 " ns, v4lBufferCount %u", __FUNCTION__, mMaxLagNs,
+           v4lBufferCount);
+ 
++    // mothershipOS: the rest of our own buffers (none: MMAP after all)
++    if (mDmabufCapture && allocCaptureBuffersLocked(v4l2Fmt, v4lBufferCount) != 0) {
++        ALOGW("%s: not enough capture buffers of our own: MMAP", __FUNCTION__);
++        mDmabufCapture = false;
++        mCaptureBuffers.clear();
++    }
++
+     // VIDIOC_REQBUFS: create buffers
+     v4l2_requestbuffers req_buffers{};
+     req_buffers.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    req_buffers.memory = V4L2_MEMORY_MMAP;
++    req_buffers.memory = v4l2Memory();
+     req_buffers.count = v4lBufferCount;
+     if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_REQBUFS, &req_buffers)) < 0) {
+         ALOGE("%s: VIDIOC_REQBUFS failed: %s", __FUNCTION__, strerror(errno));
+@@ -1305,15 +1368,18 @@
+               v4lBufferCount, req_buffers.count);
+         return NO_MEMORY;
+     }
++    if (mDmabufCapture && allocCaptureBuffersLocked(v4l2Fmt, req_buffers.count) != 0) {
++        return NO_MEMORY;
++    }
+ 
+     // VIDIOC_QUERYBUF:  get buffer offset in the V4L2 fd
+     // VIDIOC_QBUF: send buffer to driver
+     mV4L2BufferCount = req_buffers.count;
+     for (uint32_t i = 0; i < req_buffers.count; i++) {
+-        v4l2_buffer buffer = {
+-                .index = i, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP};
++        v4l2_buffer buffer = {.index = i, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE};
++        setV4l2Memory(&buffer);
+ 
+-        if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_QUERYBUF, &buffer)) < 0) {
++        if (!mDmabufCapture && TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_QUERYBUF, &buffer)) < 0) {
+             ALOGE("%s: QUERYBUF %d failed: %s", __FUNCTION__, i, strerror(errno));
+             return -errno;
+         }
+@@ -1350,12 +1416,13 @@
+     for (int i = 0; i < kBadFramesAfterStreamOn; i++) {
+         v4l2_buffer buffer{};
+         buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        buffer.memory = V4L2_MEMORY_MMAP;
++        buffer.memory = v4l2Memory();
+         if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_DQBUF, &buffer)) < 0) {
+             ALOGE("%s: DQBUF fails: %s", __FUNCTION__, strerror(errno));
+             return -errno;
+         }
+ 
++        setV4l2Memory(&buffer);
+         if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_QBUF, &buffer)) < 0) {
+             ALOGE("%s: QBUF index %d fails: %s", __FUNCTION__, buffer.index, strerror(errno));
+             return -errno;
+@@ -1391,7 +1458,7 @@
+     do {
+         ATRACE_BEGIN("VIDIOC_DQBUF");
+         buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        buffer.memory = V4L2_MEMORY_MMAP;
++        buffer.memory = v4l2Memory();
+         if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_DQBUF, &buffer)) < 0) {
+             ALOGE("%s: DQBUF fails: %s", __FUNCTION__, strerror(errno));
+             return ret;
+@@ -1440,6 +1507,7 @@
+         if (lagNs > mMaxLagNs) {
+             ALOGI("%s: drop too old buffer, index %d, lag %" PRIu64 " ns > max %" PRIu64 " ns", __FUNCTION__,
+                   buffer.index, lagNs, mMaxLagNs);
++            setV4l2Memory(&buffer);
+             int retVal = ioctl(mV4l2Fd.get(), VIDIOC_QBUF, &buffer);
+             if (retVal) {
+                 ALOGE("%s: unexpected VIDIOC_QBUF failed, retVal %d", __FUNCTION__, retVal);
+@@ -1453,9 +1521,62 @@
+         mNumDequeuedV4l2Buffers++;
+     }
+ 
+-    return std::make_unique<V4L2Frame>(mV4l2StreamingFmt.width, mV4l2StreamingFmt.height,
+-                                       mV4l2StreamingFmt.fourcc, buffer.index, mV4l2Fd.get(),
+-                                       buffer.bytesused, buffer.m.offset);
++    auto frame = std::make_unique<V4L2Frame>(mV4l2StreamingFmt.width, mV4l2StreamingFmt.height,
++                                             mV4l2StreamingFmt.fourcc, buffer.index, mV4l2Fd.get(),
++                                             buffer.bytesused, mDmabufCapture ? 0 : buffer.m.offset);
++    // mothershipOS: the NV12 layout, and our own buffer behind a DMABUF frame
++    frame->mStride = mV4l2Stride;
++    frame->mChromaOffset = mV4l2ChromaOffset;
++    if (mDmabufCapture && buffer.index < mCaptureBuffers.size()) {
++        const CaptureBuffer& cb = mCaptureBuffers[buffer.index];
++        frame->mBuffer = cb.buffer;
++        frame->mDmabufFd = cb.fd;
++        frame->mKey = cb.key;
++    }
++    return frame;
++}
++
++// mothershipOS: our own NV12 capture buffers, up to count (the first one learns the layout). Gralloc gives
++// camera-written YCbCr_420_888 as NV12 (on a mothershipOS host: the Venus layout, linear).
++int ExternalCameraDeviceSession::allocCaptureBuffersLocked(const SupportedV4L2Format& v4l2Fmt, size_t count) {
++    const uint64_t usage = GRALLOC_USAGE_HW_CAMERA_WRITE | GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_SW_READ_OFTEN;
++    while (mCaptureBuffers.size() < count) {
++        sp<GraphicBuffer> gb = sp<GraphicBuffer>::make(v4l2Fmt.width, v4l2Fmt.height,
++                                                       HAL_PIXEL_FORMAT_YCbCr_420_888, 1, usage,
++                                                       "ExternalCameraCapture");
++        if (gb->initCheck() != OK || gb->handle == nullptr || gb->handle->numFds < 1) {
++            ALOGW("%s: cannot allocate a %ux%u capture buffer", __FUNCTION__, v4l2Fmt.width, v4l2Fmt.height);
++            return -ENOMEM;
++        }
++        const int fd = gb->handle->data[0];
++        const off_t length = lseek(fd, 0, SEEK_END);
++        struct stat st;
++        if (length <= 0 || fstat(fd, &st) != 0) return -EINVAL;
++        if (mCaptureBuffers.empty()) {
++            void* base = nullptr;
++            android_ycbcr y{};
++            if (gb->lock(GRALLOC_USAGE_SW_READ_OFTEN, &base) != OK) return -EINVAL;
++            gb->unlock();
++            if (gb->lockYCbCr(GRALLOC_USAGE_SW_READ_OFTEN, &y) != OK) return -EINVAL;
++            gb->unlock();
++            if (base == nullptr || y.y != base || y.chroma_step != 2 || y.cr <= y.cb || y.cstride != y.ystride) {
++                ALOGW("%s: the capture buffers are not NV12", __FUNCTION__);
++                return -EINVAL;
++            }
++            mV4l2Stride = static_cast<uint32_t>(y.ystride);
++            mV4l2ChromaOffset = static_cast<uint32_t>(static_cast<uint8_t*>(y.cb) - static_cast<uint8_t*>(base));
++        }
++        mCaptureBuffers.push_back({gb, fd, static_cast<uint32_t>(length), static_cast<uint64_t>(st.st_ino)});
++    }
++    return 0;
++}
++
++void ExternalCameraDeviceSession::setV4l2Memory(v4l2_buffer* b) const {
++    b->memory = v4l2Memory();
++    if (mDmabufCapture && b->index < mCaptureBuffers.size()) {
++        b->m.fd = mCaptureBuffers[b->index].fd;
++        b->length = mCaptureBuffers[b->index].length;
++    }
+ }
+ 
+ void ExternalCameraDeviceSession::enqueueV4l2Frame(const std::shared_ptr<V4L2Frame>& frame) {
+@@ -1464,8 +1585,8 @@
+     ATRACE_BEGIN("VIDIOC_QBUF");
+     v4l2_buffer buffer{};
+     buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    buffer.memory = V4L2_MEMORY_MMAP;
+     buffer.index = frame->mBufferIndex;
++    setV4l2Memory(&buffer);
+     if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_QBUF, &buffer)) < 0) {
+         ALOGE("%s: QBUF index %d fails: %s", __FUNCTION__, frame->mBufferIndex, strerror(errno));
+         return;
+@@ -1618,13 +1739,15 @@
+     // VIDIOC_REQBUFS: clear buffers
+     v4l2_requestbuffers req_buffers{};
+     req_buffers.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    req_buffers.memory = V4L2_MEMORY_MMAP;
++    req_buffers.memory = v4l2Memory();
+     req_buffers.count = 0;
+     if (TEMP_FAILURE_RETRY(ioctl(mV4l2Fd.get(), VIDIOC_REQBUFS, &req_buffers)) < 0) {
+         ALOGE("%s: REQBUFS failed: %s", __FUNCTION__, strerror(errno));
+         return -errno;
+     }
+ 
++    mCaptureBuffers.clear();
++    mDmabufCapture = false;
+     mV4l2Streaming = false;
+     return OK;
+ }
+@@ -2904,6 +3027,71 @@
+     mBlobBufferSize = 0;
+ }
+ 
++// mothershipOS: the GPU path, made on the output thread (its EGL context lives there).
++// ro.vendor.camera.external.gpu=false keeps the CPU path.
++bool ExternalCameraDeviceSession::OutputThread::gpuReady() {
++    if (!mGpuTried) {
++        mGpuTried = true;
++        if (property_get_bool("ro.vendor.camera.external.gpu", true)) {
++            mGpu = std::make_unique<ExternalCameraGpu>();
++            if (!mGpu->init()) {
++                ALOGW("%s: no GPU conversion, the CPU converts", __FUNCTION__);
++                mGpu.reset();
++            }
++        }
++    }
++    return mGpu != nullptr;
++}
++
++// mothershipOS: render the uploaded frame into a semi-planar YUV output buffer (its plane layout learned once,
++// from a CPU lock). false: not on the GPU (planar, not importable, an error): the CPU path does it.
++bool ExternalCameraDeviceSession::OutputThread::gpuConvert(HalStreamBuffer& halBuf) {
++    buffer_handle_t handle = *(halBuf.bufPtr);
++    if (handle == nullptr || handle->numFds < 1) return false;
++    const int fd = handle->data[0];
++    struct stat st;
++    if (fstat(fd, &st) != 0) return false;
++    const uint64_t key = st.st_ino;
++    auto it = mGpuLayouts.find(key);
++    if (it == mGpuLayouts.end()) {
++        if (mGpuLayouts.size() >= 64) mGpuLayouts.clear();
++        GpuLayout l{};
++        android::Rect rect{0, 0, static_cast<int32_t>(halBuf.width), static_cast<int32_t>(halBuf.height)};
++        uint8_t* base = static_cast<uint8_t*>(
++                sHandleImporter.lock(handle, static_cast<uint64_t>(halBuf.usage), rect));
++        sHandleImporter.unlock(handle);
++        android_ycbcr y = sHandleImporter.lockYCbCr(handle, static_cast<uint64_t>(halBuf.usage), rect);
++        sHandleImporter.unlock(handle);
++        if (base != nullptr && y.y != nullptr && y.chroma_step == 2) {
++            uint8_t* c = static_cast<uint8_t*>(std::min(y.cb, y.cr));
++            l = {.ok = true,
++                 .yOffset = static_cast<uint32_t>(static_cast<uint8_t*>(y.y) - base),
++                 .yStride = static_cast<uint32_t>(y.ystride),
++                 .cOffset = static_cast<uint32_t>(c - base),
++                 .cStride = static_cast<uint32_t>(y.cstride),
++                 .vu = y.cr < y.cb};
++        }
++        it = mGpuLayouts.emplace(key, l).first;
++    }
++    if (!it->second.ok) return false;
++    const GpuLayout& l = it->second;
++    IMapper::Rect crop;
++    if (getCropRect(mCroppingType,
++                    Size{static_cast<int32_t>(mYu12Frame->mWidth), static_cast<int32_t>(mYu12Frame->mHeight)},
++                    Size{static_cast<int32_t>(halBuf.width), static_cast<int32_t>(halBuf.height)}, &crop) != 0) {
++        return false;
++    }
++    ExternalCameraGpu::Target t{.fd = fd, .width = static_cast<uint32_t>(halBuf.width),
++                                .height = static_cast<uint32_t>(halBuf.height),
++                                .yOffset = l.yOffset, .yStride = l.yStride, .cOffset = l.cOffset,
++                                .cStride = l.cStride, .vu = l.vu, .key = key};
++    ATRACE_BEGIN("gpuConvert");
++    bool ok = mGpu->convert(t, crop.left, crop.top, crop.width, crop.height);
++    ATRACE_END();
++    if (!ok) mGpuLayouts[key].ok = false;  // this buffer stays on the CPU
++    return ok;
++}
++
+ bool ExternalCameraDeviceSession::OutputThread::threadLoop() {
+     std::shared_ptr<HalRequest> req;
+     auto parent = mParent.lock();
+@@ -2929,7 +3117,7 @@
+     };
+ 
+     if (req->frameIn->mFourcc != V4L2_PIX_FMT_MJPEG && req->frameIn->mFourcc != V4L2_PIX_FMT_Z16 &&
+-        req->frameIn->mFourcc != V4L2_PIX_FMT_XBGR32) {
++        req->frameIn->mFourcc != V4L2_PIX_FMT_XBGR32 && req->frameIn->mFourcc != V4L2_PIX_FMT_NV12) {
+         return onDeviceError("%s: do not support V4L2 format %c%c%c%c", __FUNCTION__,
+                              req->frameIn->mFourcc & 0xFF, (req->frameIn->mFourcc >> 8) & 0xFF,
+                              (req->frameIn->mFourcc >> 16) & 0xFF,
+@@ -2945,9 +3133,18 @@
+     std::unique_lock<std::mutex> lk(mBufferLock);
+     // Convert input V4L2 frame to YU12 of the same size
+     // TODO: see if we can save some computation by converting to YV12 here
+-    uint8_t* inData;
+-    size_t inDataSize;
+-    if (req->frameIn->getData(&inData, &inDataSize) != 0) {
++    // mothershipOS: NV12 frames come from this session's V4L2 device (V4L2Frame); one in our own buffer (DMABUF)
++    // is mapped only when the CPU needs it (JPEG, planar outputs, the CPU path)
++    uint8_t* inData = nullptr;
++    size_t inDataSize = 0;
++    V4L2Frame* nv12In = req->frameIn->mFourcc == V4L2_PIX_FMT_NV12 ? static_cast<V4L2Frame*>(req->frameIn.get())
++                                                                     : nullptr;
++    const bool dmabufIn = nv12In != nullptr && nv12In->mDmabufFd >= 0;
++    const bool hostFmt = req->frameIn->mFourcc == V4L2_PIX_FMT_XBGR32 || nv12In != nullptr;
++    auto mapIn = [&]() -> bool {
++        return inData != nullptr || req->frameIn->getData(&inData, &inDataSize) == 0;
++    };
++    if (!dmabufIn && !mapIn()) {
+         lk.unlock();
+         return onDeviceError("%s: V4L2 buffer map failed", __FUNCTION__);
+     }
+@@ -2976,14 +3173,59 @@
+         }
+     }
+ 
+-    // mothershipOS: uncompressed BGRx frames (a mothershipOS host's cameras), straight to YU12
+-    if (req->frameIn->mFourcc == V4L2_PIX_FMT_XBGR32 && !mCameraMuted) {
+-        ATRACE_BEGIN("XBGR32toI420");
+-        res = libyuv::ARGBToI420(inData, mYu12Frame->mWidth * 4, static_cast<uint8_t*>(mYu12FrameLayout.y),
+-                                 mYu12FrameLayout.yStride, static_cast<uint8_t*>(mYu12FrameLayout.cb),
+-                                 mYu12FrameLayout.cStride, static_cast<uint8_t*>(mYu12FrameLayout.cr),
+-                                 mYu12FrameLayout.cStride, mYu12Frame->mWidth, mYu12Frame->mHeight);
++    // mothershipOS: XBGR32 frames (a mothershipOS host's cameras): every semi-planar YUV output is rendered on the
++    // GPU from one upload; YU12 (the CPU path) only for what the GPU path doesn't do (JPEG, planar, Y16) or
++    // when it fails
++    bool gpu = (req->frameIn->mFourcc == V4L2_PIX_FMT_XBGR32 || dmabufIn) && !mCameraMuted && gpuReady();
++    bool needYu12 = !gpu;
++    for (auto& halBuf : req->buffers) {
++        if (halBuf.format != PixelFormat::YCBCR_420_888) needYu12 = true;
++    }
++    if (gpu) {
++        ATRACE_BEGIN("gpuUpload");
++        const bool ok = dmabufIn ? mGpu->setSource({.fd = nv12In->mDmabufFd,
++                                                    .width = static_cast<uint32_t>(nv12In->mWidth),
++                                                    .height = static_cast<uint32_t>(nv12In->mHeight),
++                                                    .stride = nv12In->mStride,
++                                                    .cOffset = nv12In->mChromaOffset,
++                                                    .key = nv12In->mKey})
++                                 : mGpu->upload(inData, mYu12Frame->mWidth, mYu12Frame->mHeight);
++        if (!ok) {
++            ALOGW("%s: GPU upload failed, converting on the CPU", __FUNCTION__);
++            gpu = false;
++            needYu12 = true;
++        }
+         ATRACE_END();
++    }
++    bool yu12Done = false;
++    auto convertYu12 = [&]() -> int {
++        if (yu12Done) return 0;
++        yu12Done = true;
++        if (!mapIn()) return -EINVAL;
++        int r;
++        if (nv12In != nullptr) {
++            ATRACE_BEGIN("NV12toI420");
++            r = libyuv::NV12ToI420(inData, nv12In->mStride, inData + nv12In->mChromaOffset, nv12In->mStride,
++                                   static_cast<uint8_t*>(mYu12FrameLayout.y), mYu12FrameLayout.yStride,
++                                   static_cast<uint8_t*>(mYu12FrameLayout.cb), mYu12FrameLayout.cStride,
++                                   static_cast<uint8_t*>(mYu12FrameLayout.cr), mYu12FrameLayout.cStride,
++                                   mYu12Frame->mWidth, mYu12Frame->mHeight);
++        } else {
++            ATRACE_BEGIN("XBGR32toI420");
++            r = libyuv::ARGBToI420(inData, mYu12Frame->mWidth * 4, static_cast<uint8_t*>(mYu12FrameLayout.y),
++                                   mYu12FrameLayout.yStride, static_cast<uint8_t*>(mYu12FrameLayout.cb),
++                                   mYu12FrameLayout.cStride, static_cast<uint8_t*>(mYu12FrameLayout.cr),
++                                   mYu12FrameLayout.cStride, mYu12Frame->mWidth, mYu12Frame->mHeight);
++        }
++        ATRACE_END();
++        return r;
++    };
++    bool gpuUsed = false;
++
++    if (hostFmt && !mCameraMuted && !needYu12) {
++        res = 0;
++    } else if (hostFmt && !mCameraMuted) {
++        res = convertYu12();
+         if (res != 0) {
+             ALOGE("%s: Convert V4L2 frame to YU12 failed! res %d", __FUNCTION__, res);
+             lk.unlock();
+@@ -2994,7 +3236,7 @@
+             signalRequestDone();
+             return true;
+         }
+-    } else if (req->frameIn->mFourcc == V4L2_PIX_FMT_MJPEG || req->frameIn->mFourcc == V4L2_PIX_FMT_XBGR32) {
++    } else if (req->frameIn->mFourcc == V4L2_PIX_FMT_MJPEG || hostFmt) {
+         // TODO: in some special case maybe we can decode jpg directly to gralloc output?
+         ATRACE_BEGIN("MJPGtoI420");
+         res = 0;
+@@ -3078,6 +3320,10 @@
+         // Gralloc lockYCbCr the buffer
+         switch (halBuf.format) {
+             case PixelFormat::BLOB: {
++                if (hostFmt && !mCameraMuted && convertYu12() != 0) {
++                    lk.unlock();
++                    return onDeviceError("%s: YU12 conversion failed!", __FUNCTION__);
++                }
+                 int ret = createJpegLocked(halBuf, req->setting);
+ 
+                 if (ret != 0) {
+@@ -3098,6 +3344,15 @@
+             } break;
+             case PixelFormat::YCBCR_420_888:
+             case PixelFormat::YV12: {
++                // mothershipOS: on the GPU when it can; else the frame's YU12 (made now if not yet)
++                if (gpu && halBuf.format == PixelFormat::YCBCR_420_888 && gpuConvert(halBuf)) {
++                    gpuUsed = true;
++                    break;
++                }
++                if (hostFmt && !mCameraMuted && convertYu12() != 0) {
++                    lk.unlock();
++                    return onDeviceError("%s: YU12 conversion failed!", __FUNCTION__);
++                }
+                 android::Rect outRect{0, 0, static_cast<int32_t>(halBuf.width),
+                                       static_cast<int32_t>(halBuf.height)};
+                 android_ycbcr result = sHandleImporter.lockYCbCr(
+@@ -3150,6 +3405,11 @@
+                 return onDeviceError("%s: unknown output format %x", __FUNCTION__, halBuf.format);
+         }
+     }  // for each buffer
++    if (gpuUsed) {
++        ATRACE_BEGIN("gpuFinish");
++        mGpu->finish();
++        ATRACE_END();
++    }
+     mScaledYu12Frames.clear();
+ 
+     // Don't hold the lock while calling back to parent
+diff -ruN a/camera/device/default/ExternalCameraDeviceSession.h b/camera/device/default/ExternalCameraDeviceSession.h
+--- a/camera/device/default/ExternalCameraDeviceSession.h	2026-11-20 12:55:37.726520055 +0000
++++ b/camera/device/default/ExternalCameraDeviceSession.h	2026-11-20 12:55:37.804522238 +0000
+@@ -18,6 +18,9 @@
+ #define HARDWARE_INTERFACES_CAMERA_DEVICE_DEFAULT_EXTERNALCAMERADEVICESESSION_H_
+ 
+ #include <ExternalCameraUtils.h>
++#include <map>
++#include <memory>
++#include <linux/videodev2.h>
+ #include <SimpleThread.h>
+ #include <aidl/android/hardware/camera/common/Status.h>
+ #include <aidl/android/hardware/camera/device/BnCameraDeviceSession.h>
+@@ -33,11 +36,14 @@
+ #include <list>
+ 
+ namespace android {
++class GraphicBuffer;
+ namespace hardware {
+ namespace camera {
+ namespace device {
+ namespace implementation {
+ 
++class ExternalCameraGpu;
++
+ using ::aidl::android::hardware::camera::common::Status;
+ using ::aidl::android::hardware::camera::device::BnCameraDeviceSession;
+ using ::aidl::android::hardware::camera::device::BufferCache;
+@@ -223,6 +229,18 @@
+         // (Format convert) -> output gralloc frames
+         mutable std::mutex mBufferLock;  // Protect access to intermediate buffers
+         std::shared_ptr<AllocatedFrame> mYu12Frame;
++        // mothershipOS: the per-stream conversion on the GPU (ExternalCameraGpu), made on the output thread when
++        // first needed; the plane layouts of the output buffers by their dma-buf (inode)
++        struct GpuLayout {
++            bool ok;
++            uint32_t yOffset, yStride, cOffset, cStride;
++            bool vu;
++        };
++        std::unique_ptr<ExternalCameraGpu> mGpu;
++        bool mGpuTried = false;
++        std::map<uint64_t, GpuLayout> mGpuLayouts;
++        bool gpuReady();
++        bool gpuConvert(HalStreamBuffer& halBuf);
+         std::shared_ptr<AllocatedFrame> mYu12ThumbFrame;
+         std::unordered_map<Size, std::shared_ptr<AllocatedFrame>, SizeHasher> mIntermediateBuffers;
+         std::unordered_map<Size, std::shared_ptr<AllocatedFrame>, SizeHasher> mScaledYu12Frames;
+@@ -339,6 +357,22 @@
+     size_t mNumDequeuedV4l2Buffers = 0;
+     uint32_t mMaxV4L2BufferSize = 0;
+ 
++    // mothershipOS: NV12 capture into our own gralloc buffers (DMABUF: a mothershipOS host renders into them, the
++    // GPU path samples them), else MMAP; the NV12 layout (luma stride, chroma plane offset)
++    struct CaptureBuffer {
++        android::sp<android::GraphicBuffer> buffer;
++        int fd;
++        uint32_t length;
++        uint64_t key;
++    };
++    std::vector<CaptureBuffer> mCaptureBuffers;
++    bool mDmabufCapture = false;
++    uint32_t mV4l2Stride = 0;
++    uint32_t mV4l2ChromaOffset = 0;
++    int allocCaptureBuffersLocked(const SupportedV4L2Format& v4l2Fmt, size_t count);
++    uint32_t v4l2Memory() const { return mDmabufCapture ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP; }
++    void setV4l2Memory(v4l2_buffer* b) const;
++
+     // Not protected by mLock (but might be used when mLock is locked)
+     std::shared_ptr<OutputThread> mOutputThread;
+ 
+diff -ruN a/camera/device/default/ExternalCameraGpu.cpp b/camera/device/default/ExternalCameraGpu.cpp
+--- a/camera/device/default/ExternalCameraGpu.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/camera/device/default/ExternalCameraGpu.cpp	2026-11-20 12:55:37.777521482 +0000
+@@ -0,0 +1,345 @@
++/*
++ * mothershipOS: the external camera HAL's per-stream conversion on the GPU (see ExternalCameraGpu.h).
++ */
++
++#define LOG_TAG "ExtCamGpu"
++
++#include "ExternalCameraGpu.h"
++
++#include <drm/drm_fourcc.h>
++#include <log/log.h>
++
++#include <string>
++
++namespace android {
++namespace hardware {
++namespace camera {
++namespace device {
++namespace implementation {
++
++namespace {
++
++// a full-screen triangle; texture coordinates over the crop rect (y down: the frame's first row on top)
++const char* kVertex = R"(#version 300 es
++uniform vec4 uCrop;  // x0, y0, x1, y1 in normalized source coordinates
++out highp vec2 vUv;
++void main() {
++    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
++    vUv = mix(uCrop.xy, uCrop.zw, p);
++    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
++}
++)";
++
++// the source texture holds B, G, R, X in r, g, b, a (XBGR32 uploaded as RGBA)
++const char* kLuma = R"(#version 300 es
++precision highp float;
++uniform sampler2D uSrc;
++in highp vec2 vUv;
++out vec4 oColor;
++void main() {
++    vec3 rgb = texture(uSrc, vUv).bgr;
++    float y = dot(rgb, vec3(0.2578125, 0.50390625, 0.09765625)) + 16.0 / 255.0;
++    oColor = vec4(y, 0.0, 0.0, 1.0);
++}
++)";
++
++// half size: the bilinear sample at a chroma pixel's centre averages the 2x2 source pixels under it
++const char* kChroma = R"(#version 300 es
++precision highp float;
++uniform sampler2D uSrc;
++uniform float uVu;
++in highp vec2 vUv;
++out vec4 oColor;
++void main() {
++    vec3 rgb = texture(uSrc, vUv).bgr;
++    float u = dot(rgb, vec3(-0.1484375, -0.2890625, 0.4375)) + 0.5;
++    float v = dot(rgb, vec3(0.4375, -0.3671875, -0.0703125)) + 0.5;
++    oColor = uVu > 0.5 ? vec4(v, u, 0.0, 1.0) : vec4(u, v, 0.0, 1.0);
++}
++)";
++
++// from an NV12 source: the luma plane (R8) and the chroma plane (RG88: U, V) scaled as they are
++const char* kLumaNv12 = R"(#version 300 es
++precision highp float;
++uniform sampler2D uSrc;
++in highp vec2 vUv;
++out vec4 oColor;
++void main() {
++    oColor = vec4(texture(uSrc, vUv).r, 0.0, 0.0, 1.0);
++}
++)";
++const char* kChromaNv12 = R"(#version 300 es
++precision highp float;
++uniform sampler2D uSrc;
++uniform float uVu;
++in highp vec2 vUv;
++out vec4 oColor;
++void main() {
++    vec2 c = texture(uSrc, vUv).rg;
++    oColor = uVu > 0.5 ? vec4(c.g, c.r, 0.0, 1.0) : vec4(c.r, c.g, 0.0, 1.0);
++}
++)";
++
++GLuint compile(GLenum type, const char* src) {
++    GLuint s = glCreateShader(type);
++    glShaderSource(s, 1, &src, nullptr);
++    glCompileShader(s);
++    GLint ok = 0;
++    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        char log[512];
++        glGetShaderInfoLog(s, sizeof(log), nullptr, log);
++        ALOGE("shader: %s", log);
++        glDeleteShader(s);
++        return 0;
++    }
++    return s;
++}
++
++GLuint link(const char* frag) {
++    GLuint vs = compile(GL_VERTEX_SHADER, kVertex), fs = compile(GL_FRAGMENT_SHADER, frag);
++    if (!vs || !fs) return 0;
++    GLuint p = glCreateProgram();
++    glAttachShader(p, vs);
++    glAttachShader(p, fs);
++    glLinkProgram(p);
++    glDeleteShader(vs);
++    glDeleteShader(fs);
++    GLint ok = 0;
++    glGetProgramiv(p, GL_LINK_STATUS, &ok);
++    if (!ok) {
++        glDeleteProgram(p);
++        return 0;
++    }
++    return p;
++}
++
++bool hasExtension(const char* list, const char* name) {
++    if (list == nullptr) return false;
++    std::string l = std::string(" ") + list + " ";
++    return l.find(std::string(" ") + name + " ") != std::string::npos;
++}
++
++}  // namespace
++
++ExternalCameraGpu::~ExternalCameraGpu() {
++    if (mDisplay == EGL_NO_DISPLAY) return;
++    eglMakeCurrent(mDisplay, mSurface, mSurface, mContext);
++    clearCache();
++    if (mSrc) glDeleteTextures(1, &mSrc);
++    for (GLuint p : mProgram) {
++        if (p) glDeleteProgram(p);
++    }
++    eglMakeCurrent(mDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++    if (mContext != EGL_NO_CONTEXT) eglDestroyContext(mDisplay, mContext);
++    if (mSurface != EGL_NO_SURFACE) eglDestroySurface(mDisplay, mSurface);
++    eglTerminate(mDisplay);
++}
++
++bool ExternalCameraGpu::init() {
++    mDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++    if (mDisplay == EGL_NO_DISPLAY || !eglInitialize(mDisplay, nullptr, nullptr)) {
++        ALOGW("no EGL display");
++        mDisplay = EGL_NO_DISPLAY;
++        return false;
++    }
++    // Android's EGL loader advertises only the extensions it knows: dma-buf import (EGL_LINUX_DMA_BUF_EXT images)
++    // goes through to the driver (Mesa) without being listed; an import that fails falls back per buffer
++    const char* ext = eglQueryString(mDisplay, EGL_EXTENSIONS);
++    const bool surfaceless = hasExtension(ext, "EGL_KHR_surfaceless_context");
++    eglBindAPI(EGL_OPENGL_ES_API);
++    const EGLint cfgAttrs[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR, EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
++                               EGL_NONE};
++    EGLConfig cfg;
++    EGLint n = 0;
++    if (!eglChooseConfig(mDisplay, cfgAttrs, &cfg, 1, &n) || n < 1) {
++        ALOGW("no GLES3 config");
++        return false;
++    }
++    const EGLint ctxAttrs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
++    mContext = eglCreateContext(mDisplay, cfg, EGL_NO_CONTEXT, ctxAttrs);
++    if (!surfaceless) {
++        // a 1x1 pbuffer to be current with (all rendering goes to the buffers' framebuffers)
++        const EGLint pbAttrs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
++        mSurface = eglCreatePbufferSurface(mDisplay, cfg, pbAttrs);
++    }
++    if (mContext == EGL_NO_CONTEXT ||
++        !eglMakeCurrent(mDisplay, mSurface, mSurface, mContext)) {
++        ALOGW("no GLES3 context");
++        return false;
++    }
++    mCreateImage = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
++    mDestroyImage = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
++    mImageTargetTexture = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
++            eglGetProcAddress("glEGLImageTargetTexture2DOES"));
++    if (!mCreateImage || !mDestroyImage || !mImageTargetTexture) {
++        ALOGW("no EGLImage entry points");
++        return false;
++    }
++    const char* frags[4] = {kLuma, kChroma, kLumaNv12, kChromaNv12};
++    for (int i = 0; i < 4; i++) {
++        mProgram[i] = link(frags[i]);
++        if (!mProgram[i]) return false;
++        mCrop[i] = glGetUniformLocation(mProgram[i], "uCrop");
++        mVu[i] = glGetUniformLocation(mProgram[i], "uVu");
++        glUseProgram(mProgram[i]);
++        glUniform1i(glGetUniformLocation(mProgram[i], "uSrc"), 0);
++    }
++    glGenTextures(1, &mSrc);
++    glBindTexture(GL_TEXTURE_2D, mSrc);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    ALOGI("GPU conversion: %s", reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
++    return true;
++}
++
++bool ExternalCameraGpu::upload(const uint8_t* data, int width, int height) {
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, mSrc);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++    if (width != mSrcWidth || height != mSrcHeight) {
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++        mSrcWidth = width;
++        mSrcHeight = height;
++    }
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, data);
++    mNv12 = false;
++    return glGetError() == GL_NO_ERROR;
++}
++
++bool ExternalCameraGpu::setSource(const Source& s) {
++    if (s.width < 2 || s.height < 2) return false;
++    Import* im = importSource(s);
++    if (im == nullptr) return false;
++    mSrcPlane[0] = im->tex[0];
++    mSrcPlane[1] = im->tex[1];
++    mSrcWidth = s.width;
++    mSrcHeight = s.height;
++    mNv12 = true;
++    return true;
++}
++
++ExternalCameraGpu::Import* ExternalCameraGpu::importSource(const Source& s) {
++    auto it = mSources.find(s.key);
++    if (it != mSources.end()) return &it->second;
++    if (mSources.size() >= 16) {
++        for (auto& [key, im] : mSources) release(im);
++        mSources.clear();
++    }
++    Import im;
++    for (int plane = 0; plane < 2; plane++) {
++        const EGLint attrs[] = {
++                EGL_WIDTH, static_cast<EGLint>(plane ? s.width / 2 : s.width),
++                EGL_HEIGHT, static_cast<EGLint>(plane ? s.height / 2 : s.height),
++                EGL_LINUX_DRM_FOURCC_EXT, static_cast<EGLint>(plane ? DRM_FORMAT_GR88 : DRM_FORMAT_R8),
++                EGL_DMA_BUF_PLANE0_FD_EXT, s.fd,
++                EGL_DMA_BUF_PLANE0_OFFSET_EXT, static_cast<EGLint>(plane ? s.cOffset : 0),
++                EGL_DMA_BUF_PLANE0_PITCH_EXT, static_cast<EGLint>(s.stride),
++                EGL_NONE};
++        im.image[plane] = mCreateImage(mDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attrs);
++        if (im.image[plane] == EGL_NO_IMAGE_KHR) {
++            ALOGW("cannot import plane %d of a %ux%u capture buffer (0x%x)", plane, s.width, s.height,
++                  eglGetError());
++            release(im);
++            return nullptr;
++        }
++        glGenTextures(1, &im.tex[plane]);
++        glBindTexture(GL_TEXTURE_2D, im.tex[plane]);
++        mImageTargetTexture(GL_TEXTURE_2D, im.image[plane]);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    }
++    return &mSources.emplace(s.key, im).first->second;
++}
++
++ExternalCameraGpu::Import* ExternalCameraGpu::importTarget(const Target& t) {
++    auto it = mImports.find(t.key);
++    if (it != mImports.end()) return &it->second;
++    // buffers come and go with the streams: keep the imports bounded
++    if (mImports.size() >= 64) clearCache();
++    Import im;
++    for (int plane = 0; plane < 2; plane++) {
++        const EGLint attrs[] = {
++                EGL_WIDTH, static_cast<EGLint>(plane ? t.width / 2 : t.width),
++                EGL_HEIGHT, static_cast<EGLint>(plane ? t.height / 2 : t.height),
++                EGL_LINUX_DRM_FOURCC_EXT, static_cast<EGLint>(plane ? DRM_FORMAT_GR88 : DRM_FORMAT_R8),
++                EGL_DMA_BUF_PLANE0_FD_EXT, t.fd,
++                EGL_DMA_BUF_PLANE0_OFFSET_EXT, static_cast<EGLint>(plane ? t.cOffset : t.yOffset),
++                EGL_DMA_BUF_PLANE0_PITCH_EXT, static_cast<EGLint>(plane ? t.cStride : t.yStride),
++                EGL_NONE};
++        im.image[plane] = mCreateImage(mDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attrs);
++        if (im.image[plane] == EGL_NO_IMAGE_KHR) {
++            ALOGW("cannot import plane %d of a %ux%u buffer (0x%x)", plane, t.width, t.height, eglGetError());
++            release(im);
++            return nullptr;
++        }
++        glGenTextures(1, &im.tex[plane]);
++        glBindTexture(GL_TEXTURE_2D, im.tex[plane]);
++        mImageTargetTexture(GL_TEXTURE_2D, im.image[plane]);
++        glGenFramebuffers(1, &im.fbo[plane]);
++        glBindFramebuffer(GL_FRAMEBUFFER, im.fbo[plane]);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, im.tex[plane], 0);
++        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++            ALOGW("plane %d of a %ux%u buffer is not renderable", plane, t.width, t.height);
++            release(im);
++            return nullptr;
++        }
++    }
++    return &mImports.emplace(t.key, im).first->second;
++}
++
++bool ExternalCameraGpu::convert(const Target& t, int cx, int cy, int cw, int ch) {
++    if (mSrcWidth == 0 || t.width < 2 || t.height < 2) return false;
++    Import* im = importTarget(t);
++    if (im == nullptr) return false;
++    const float crop[4] = {static_cast<float>(cx) / mSrcWidth, static_cast<float>(cy) / mSrcHeight,
++                           static_cast<float>(cx + cw) / mSrcWidth,
++                           static_cast<float>(cy + ch) / mSrcHeight};
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, mSrc);
++    glDisable(GL_BLEND);
++    for (int plane = 0; plane < 2; plane++) {
++        const int prog = mNv12 ? 2 + plane : plane;
++        if (mNv12) glBindTexture(GL_TEXTURE_2D, mSrcPlane[plane]);
++        glBindFramebuffer(GL_FRAMEBUFFER, im->fbo[plane]);
++        glViewport(0, 0, plane ? t.width / 2 : t.width, plane ? t.height / 2 : t.height);
++        glUseProgram(mProgram[prog]);
++        glUniform4fv(mCrop[prog], 1, crop);
++        if (plane) glUniform1f(mVu[prog], t.vu ? 1.0f : 0.0f);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++    }
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    return glGetError() == GL_NO_ERROR;
++}
++
++void ExternalCameraGpu::finish() {
++    glFinish();
++}
++
++void ExternalCameraGpu::release(Import& im) {
++    for (int plane = 0; plane < 2; plane++) {
++        if (im.fbo[plane]) glDeleteFramebuffers(1, &im.fbo[plane]);
++        if (im.tex[plane]) glDeleteTextures(1, &im.tex[plane]);
++        if (im.image[plane] != EGL_NO_IMAGE_KHR) mDestroyImage(mDisplay, im.image[plane]);
++    }
++    im = {};
++}
++
++void ExternalCameraGpu::clearCache() {
++    for (auto& [key, im] : mImports) release(im);
++    mImports.clear();
++    for (auto& [key, im] : mSources) release(im);
++    mSources.clear();
++    mNv12 = false;
++}
++
++}  // namespace implementation
++}  // namespace device
++}  // namespace camera
++}  // namespace hardware
++}  // namespace android
+diff -ruN a/camera/device/default/ExternalCameraGpu.h b/camera/device/default/ExternalCameraGpu.h
+--- a/camera/device/default/ExternalCameraGpu.h	1970-01-01 00:00:00.000000000 +0000
++++ b/camera/device/default/ExternalCameraGpu.h	2026-11-20 12:55:37.777521482 +0000
+@@ -0,0 +1,95 @@
++/*
++ * mothershipOS: the external camera HAL's per-stream conversion on the GPU.
++ *
++ * The source frame is either the capture buffer itself (NV12, the HAL's own gralloc buffer a mothershipOS host
++ * renders into: its planes sampled as R8 and RG88 dma-buf images, no CPU involved) or an uploaded XBGR32 frame
++ * (RGB to BT.601 YUV with the coefficients of libyuv's ARGBToI420, so the GPU and CPU paths look the same). Every
++ * semi-planar YUV output buffer (NV12/NV21, a gralloc buffer imported as dma-buf planes: an R8 target and an RG88
++ * one at half size) is rendered from it: crop to the output's aspect ratio, scale.
++ */
++
++#pragma once
++
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <GLES3/gl3.h>
++#include <GLES2/gl2ext.h>
++
++#include <cstdint>
++#include <map>
++#include <utility>
++
++namespace android {
++namespace hardware {
++namespace camera {
++namespace device {
++namespace implementation {
++
++class ExternalCameraGpu {
++  public:
++    ExternalCameraGpu() = default;
++    ~ExternalCameraGpu();
++    ExternalCameraGpu(const ExternalCameraGpu&) = delete;
++    ExternalCameraGpu& operator=(const ExternalCameraGpu&) = delete;
++
++    // EGL display and context (surfaceless), shaders. false: no GPU path (the CPU path is used).
++    bool init();
++    // The frame for the following conversions: XBGR32 (B, G, R, X in memory), tightly packed.
++    bool upload(const uint8_t* data, int width, int height);
++
++    // Or an NV12 dma-buf (the capture buffer), sampled where it is.
++    struct Source {
++        int fd;
++        uint32_t width, height;
++        uint32_t stride, cOffset;  // luma stride (also the chroma's), the chroma plane's offset
++        uint64_t key;              // the buffer's identity, for the cached imports
++    };
++    bool setSource(const Source& s);
++
++    struct Target {
++        int fd;            // the buffer's dma-buf
++        uint32_t width, height;
++        uint32_t yOffset, yStride;
++        uint32_t cOffset, cStride;  // the chroma plane (interleaved)
++        bool vu;           // NV21 (V first)
++        uint64_t key;      // the buffer's identity, for the cached imports
++    };
++    // Render the uploaded frame, cropped to (cx, cy, cw, ch) of it, into the target.
++    bool convert(const Target& t, int cx, int cy, int cw, int ch);
++    // Wait for the GPU (the buffers are complete when this returns).
++    void finish();
++    // Drop the cached buffer imports (the streams changed).
++    void clearCache();
++
++  private:
++    struct Import {
++        EGLImageKHR image[2] = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
++        GLuint tex[2] = {0, 0};
++        GLuint fbo[2] = {0, 0};
++    };
++    Import* importTarget(const Target& t);
++    Import* importSource(const Source& s);
++    void release(Import& im);
++
++    EGLDisplay mDisplay = EGL_NO_DISPLAY;
++    EGLContext mContext = EGL_NO_CONTEXT;
++    EGLSurface mSurface = EGL_NO_SURFACE;
++    GLuint mProgram[4] = {0, 0, 0, 0};  // from RGB: Y, chroma; from NV12: Y, chroma
++    GLint mCrop[4] = {-1, -1, -1, -1};
++    GLint mVu[4] = {-1, -1, -1, -1};
++    bool mNv12 = false;  // the source is an NV12 buffer (setSource), its planes' textures:
++    GLuint mSrcPlane[2] = {0, 0};
++    std::map<uint64_t, Import> mSources;
++    GLuint mSrc = 0;
++    int mSrcWidth = 0, mSrcHeight = 0;
++    std::map<uint64_t, Import> mImports;
++    PFNEGLCREATEIMAGEKHRPROC mCreateImage = nullptr;
++    PFNEGLDESTROYIMAGEKHRPROC mDestroyImage = nullptr;
++    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC mImageTargetTexture = nullptr;
++};
++
++}  // namespace implementation
++}  // namespace device
++}  // namespace camera
++}  // namespace hardware
++}  // namespace android
+diff -ruN a/camera/device/default/ExternalCameraUtils.cpp b/camera/device/default/ExternalCameraUtils.cpp
+--- a/camera/device/default/ExternalCameraUtils.cpp	2026-11-20 12:55:37.734520279 +0000
++++ b/camera/device/default/ExternalCameraUtils.cpp	2026-11-20 12:55:37.801522154 +0000
+@@ -29,6 +29,8 @@
+ 
+ #define HAVE_JPEG  // required for libyuv.h to export MJPEG decode APIs
+ #include <libyuv.h>
++#include <hardware/gralloc.h>
++#include <ui/GraphicBuffer.h>
+ 
+ namespace android {
+ namespace hardware {
+@@ -262,6 +264,16 @@
+     }
+ 
+     std::lock_guard<std::mutex> lk(mLock);
++    if (!mMapped && mBuffer != nullptr) {
++        // mothershipOS: our own gralloc buffer
++        void* addr = nullptr;
++        if (mBuffer->lock(GRALLOC_USAGE_SW_READ_OFTEN, &addr) != OK || addr == nullptr) {
++            ALOGE("%s: capture buffer lock failed", __FUNCTION__);
++            return -EINVAL;
++        }
++        mData = static_cast<uint8_t*>(addr);
++        mMapped = true;
++    }
+     if (!mMapped) {
+         void* addr = mmap(nullptr, mDataSize, PROT_READ, MAP_SHARED, mFd, mOffset);
+         if (addr == MAP_FAILED) {
+@@ -279,6 +291,10 @@
+ 
+ int V4L2Frame::unmap() {
+     std::lock_guard<std::mutex> lk(mLock);
++    if (mMapped && mBuffer != nullptr) {
++        mBuffer->unlock();
++        mMapped = false;
++    }
+     if (mMapped) {
+         ALOGV("%s: V4L unmap data %p size %zu", __FUNCTION__, mData, mDataSize);
+         if (munmap(mData, mDataSize) != 0) {
+diff -ruN a/camera/device/default/ExternalCameraUtils.h b/camera/device/default/ExternalCameraUtils.h
+--- a/camera/device/default/ExternalCameraUtils.h	2026-11-20 12:55:37.738520390 +0000
++++ b/camera/device/default/ExternalCameraUtils.h	2026-11-20 12:55:37.801522154 +0000
+@@ -32,6 +32,11 @@
+ #include <map>
+ #include <unordered_map>
+ #include <unordered_set>
++#include <utils/StrongPointer.h>
++
++namespace android {
++class GraphicBuffer;
++}
+ 
+ using ::aidl::android::hardware::camera::common::Status;
+ using ::aidl::android::hardware::camera::device::CaptureResult;
+@@ -165,6 +170,15 @@
+     int map(uint8_t** data, size_t* dataSize);
+     int unmap();
+ 
++    // mothershipOS: an NV12 frame's layout (luma stride, also the chroma's; the chroma plane's offset). A DMABUF
++    // frame is one of the HAL's own gralloc buffers (mBuffer: CPU access through gralloc; mDmabufFd and mKey for
++    // the GPU's import of it).
++    uint32_t mStride = 0;
++    uint32_t mChromaOffset = 0;
++    android::sp<android::GraphicBuffer> mBuffer;
++    int mDmabufFd = -1;
++    uint64_t mKey = 0;
++
+   private:
+     std::mutex mLock;
+     const int mFd;  // used for mmap but doesn't claim ownership

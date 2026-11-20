@@ -1,0 +1,18 @@
+mothershipOS: the external camera HAL also advertises a fixed AE target fps range [fps, fps] for every frame rate,
+besides the webcam range [fps/2, fps]. A mothershipOS host (mship.camera) delivers its cameras at a steady rate, and
+recording apps that only offer fixed rates (Aperture's video mode) otherwise find no frame rate and abort.
+
+diff -ru a/camera/device/default/ExternalCameraDevice.cpp b/camera/device/default/ExternalCameraDevice.cpp
+--- a/camera/device/default/ExternalCameraDevice.cpp	2026-11-19 18:55:42.871266446 +0000
++++ b/camera/device/default/ExternalCameraDevice.cpp	2026-11-19 18:55:42.891266993 +0000
+@@ -827,6 +827,10 @@
+         // Empirical: webcams often have close to 2x fps error and cannot support fixed fps range
+         fpsRanges.push_back(framerate / 2);
+         fpsRanges.push_back(framerate);
++        // mothershipOS: also the fixed range: a mothershipOS host's cameras hold their rate, and recording apps
++        // (CameraX video qualities, Aperture) only offer fixed rates
++        fpsRanges.push_back(framerate);
++        fpsRanges.push_back(framerate);
+     }
+     minFps /= 2;
+     int64_t maxFrameDuration = 1000000000LL / minFps;

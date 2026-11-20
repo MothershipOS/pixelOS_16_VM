@@ -24,6 +24,26 @@ LOCAL_HEALTH_PRODUCT_PACKAGE := \
     android.hardware.health-service.example \
     android.hardware.health-service.example_recovery
 
+# GNSS (mship.gnss): the phone's receiver from the host (NMEA on /dev/gnss0) instead of Cuttlefish's mock HAL, which
+# reports a fixed position. Set before device_vendor.mk, which only picks its default when this is empty.
+LOCAL_GNSS_PRODUCT_PACKAGE := android.hardware.gnss-service.mship
+
+# Sensors (mship.sensors): the phone's sensors through Cuttlefish's goldfish sensors sub-HAL on hvc13. Declare the
+# features of the sensors the host offers (accelerometer and compass come from handheld_core_hardware.xml), not
+# Cuttlefish's emulated barometer, humidity, ambient temperature and hinge angle.
+LOCAL_SENSOR_FILE_OVERRIDES := true
+# the HAL that talks to the host: AOSP's multi-HAL with Cuttlefish's goldfish sub-HAL (hvc13), not the default
+# example HAL (fixed fake sensors). device_vendor.mk only picks its default when this is empty.
+LOCAL_SENSOR_PRODUCT_PACKAGE := \
+    android.hardware.sensors-service.multihal \
+    android.hardware.sensors@2.1-impl.cuttlefish
+PRODUCT_COPY_FILES += \
+    device/google/cuttlefish/shared/sensors/multihal/hals.conf:$(TARGET_COPY_OUT_VENDOR)/etc/sensors/hals.conf
+PRODUCT_COPY_FILES += \
+    frameworks/native/data/etc/android.hardware.sensor.gyroscope.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.gyroscope.xml \
+    frameworks/native/data/etc/android.hardware.sensor.light.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.light.xml \
+    frameworks/native/data/etc/android.hardware.sensor.proximity.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.proximity.xml
+
 # Cuttlefish virtual hardware (vendor side)
 # Telephony (mship.modem): Cuttlefish's stock rild and RIL, which talk AT over vsock to the host's modem slot (port
 # androidboot.modem_simulator_ports); the host passes them to the phone's real modem. An empty slot = radio

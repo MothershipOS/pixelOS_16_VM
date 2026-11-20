@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- mothershipOS: Aperture lists the host's other cameras too (ids 2, 3: back 2, front 2; mship.camera), not only
+     the main back (0) and front (1) ones. -->
+<resources>
+    <bool name="config_enableAuxCameras">true</bool>
+</resources>

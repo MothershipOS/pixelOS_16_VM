@@ -33,7 +33,12 @@ PRODUCT_PACKAGES += android.hardware.camera.provider-V1-external-service
 DEVICE_MANIFEST_FILE += device/mothership/nio_vm/camera/manifest.xml
 PRODUCT_COPY_FILES += \
     device/mothership/nio_vm/camera/external_camera_config.xml:$(TARGET_COPY_OUT_VENDOR)/etc/external_camera_config.xml \
-    frameworks/native/data/etc/android.hardware.camera.external.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.camera.external.xml
+    frameworks/native/data/etc/android.hardware.camera.external.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.camera.external.xml \
+    frameworks/native/data/etc/android.hardware.camera.flash-autofocus.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.camera.flash-autofocus.xml \
+    frameworks/native/data/etc/android.hardware.camera.front.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.camera.front.xml \
+    device/mothership/nio_vm/camera/media_profiles.xml:$(TARGET_COPY_OUT_ODM)/etc/media_profiles_V1_0.xml
+# (the recording profiles: odm/etc is searched before Cuttlefish's vendor/etc/media_profiles_V1_0.xml, which only
+# knows its emulated cameras' ids 0-6; without a profile CameraX has no video quality and camera apps abort video)
 
 # Hardware video decode (mship.video): the host's Venus decoder is a V4L2 stateful decoder here (virtio-media);
 # external/v4l2_codec2 (patched: MMAP bitstream buffers, decoded frames straight into gralloc buffers as virtio

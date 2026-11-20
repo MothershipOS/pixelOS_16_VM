@@ -1,0 +1,196 @@
+mothershipOS (mship.video): MMAP buffers for the encoder. The encoder is the host's Venus through virtio-media, which
+can only share virtio objects (virtio-gpu buffers) as DMABUFs; the client's frames, the format converter's and the
+bitstream blocks come from dma-buf heaps. Both queues now use the device's MMAP buffers: each frame is copied in
+(any stride to the device's layout), each encoded chunk copied out. ro.vendor.v4l2_codec2.encoder_mmap=false
+restores the DMABUF queues.
+
+diff -ru a/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h	2026-11-19 21:31:57.708959995 +0000
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Encoder.h	2026-11-19 21:31:57.739960928 +0000
+@@ -15,6 +15,7 @@
+ #include <base/sequenced_task_runner.h>
+ #include <ui/Size.h>
+ 
++#include <v4l2_codec2/v4l2/V4L2Device.h>
+ #include <v4l2_codec2/common/Common.h>
+ #include <v4l2_codec2/components/VideoEncoder.h>
+ 
+@@ -119,6 +120,9 @@
+     // Enqueue an output buffer to store the encoded bitstream on the device output queue. Returns
+     // whether the operation was successful.
+     bool enqueueOutputBuffer();
++    // mothershipOS: MMAP buffers on both queues (frames and bitstream copied; ro.vendor.v4l2_codec2.encoder_mmap)
++    bool copyInputFrame(const InputFrame& frame, V4L2WritableBufferRef& buffer);
++    bool mMmap = true;
+     // Dequeue an input buffer the V4L2 device has finished encoding on the device input queue.
+     // Returns whether a buffer could be dequeued.
+     bool dequeueInputBuffer();
+diff -ru a/v4l2/V4L2Encoder.cpp b/v4l2/V4L2Encoder.cpp
+--- a/v4l2/V4L2Encoder.cpp	2026-11-19 21:31:57.704959874 +0000
++++ b/v4l2/V4L2Encoder.cpp	2026-11-19 21:31:57.738960898 +0000
+@@ -20,6 +20,12 @@
+ #include <v4l2_codec2/common/EncodeHelpers.h>
+ #include <v4l2_codec2/common/Fourcc.h>
+ #include <v4l2_codec2/components/BitstreamBuffer.h>
++#include <cutils/properties.h>
++#include <linux/dma-buf.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <unistd.h>
+ #include <v4l2_codec2/v4l2/V4L2Device.h>
+ 
+ namespace android {
+@@ -767,6 +773,18 @@
+              .tv_usec = static_cast<time_t>(timestamp % ::base::Time::kMicrosecondsPerSecond)});
+     size_t bufferId = buffer->bufferId();
+ 
++    // mothershipOS: the frame copied into the device's MMAP buffer (see copyInputFrame)
++    if (mMmap) {
++        if (!copyInputFrame(*frame, *buffer) || !std::move(*buffer).queueMMap()) {
++            ALOGE("Failed to queue input buffer (MMAP)");
++            onError();
++            return false;
++        }
++        ALOG_ASSERT(!mInputBuffers[bufferId]);
++        mInputBuffers[bufferId] = std::move(frame);
++        return true;
++    }
++
+     std::vector<int> fds = frame->fds();
+     if (mInputLayout->mMultiPlanar) {
+         // If the input format is multi-planar, then we need to submit one memory plane per color
+@@ -819,6 +837,73 @@
+     return true;
+ }
+ 
++// mothershipOS: copy an input frame (dma-bufs, any stride) into a MMAP input buffer (the device's layout). The
++// encoder is the host's Venus through virtio-media, which can only share virtio objects (virtio-gpu buffers) as
++// DMABUFs; the client's frames (and the format converter's) come from dma-buf heaps.
++bool V4L2Encoder::copyInputFrame(const InputFrame& frame, V4L2WritableBufferRef& buffer) {
++    const auto& planes = frame.planes();
++    const auto& fds = frame.fds();
++    const auto format = frame.pixelFormat();
++    std::vector<std::pair<void*, size_t>> maps;
++    bool ok = true;
++    for (size_t i = 0; ok && i < planes.size(); ++i) {
++        int fd = fds[std::min(i, fds.size() - 1)];
++        // one mapping per distinct fd
++        if (i > 0 && fds.size() <= i) {
++            maps.push_back(maps.back());
++            continue;
++        }
++        off_t size = lseek(fd, 0, SEEK_END);
++        void* src = size > 0 ? mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
++        if (src == MAP_FAILED) {
++            ALOGE("%s(): cannot map input plane %zu (fd %d)", __func__, i, fd);
++            ok = false;
++            break;
++        }
++        struct dma_buf_sync sync = {.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ};
++        ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
++        maps.push_back({src, static_cast<size_t>(size)});
++    }
++    for (size_t i = 0; ok && i < planes.size(); ++i) {
++        const size_t dstPlane = mInputLayout->mMultiPlanar ? i : 0;
++        uint8_t* dst = static_cast<uint8_t*>(buffer.getPlaneMapping(dstPlane));
++        if (dst == nullptr) {
++            ALOGE("%s(): cannot map device input plane %zu", __func__, dstPlane);
++            ok = false;
++            break;
++        }
++        if (!mInputLayout->mMultiPlanar) dst += mInputLayout->mPlanes[i].mOffset;
++        const size_t dstStride = mInputLayout->mPlanes[i].mStride;
++        const size_t srcStride = planes[i].mStride;
++        const ui::Size rows = planeSize(format, i, mInputLayout->mCodedSize);
++        const size_t rowBytes = std::min({static_cast<size_t>(rows.width), srcStride, dstStride});
++        const uint8_t* src = static_cast<const uint8_t*>(maps[i].first) + planes[i].mOffset;
++        const size_t avail = maps[i].second - std::min(maps[i].second, static_cast<size_t>(planes[i].mOffset));
++        for (int32_t y = 0; y < rows.height && static_cast<size_t>(y) * srcStride + rowBytes <= avail; ++y) {
++            memcpy(dst + y * dstStride, src + y * srcStride, rowBytes);
++        }
++    }
++    for (size_t i = 0; i < maps.size(); ++i) {
++        if (i > 0 && maps[i].first == maps[i - 1].first) continue;
++        struct dma_buf_sync sync = {.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ};
++        ioctl(fds[std::min(i, fds.size() - 1)], DMA_BUF_IOCTL_SYNC, &sync);
++        munmap(maps[i].first, maps[i].second);
++    }
++    if (!ok) return false;
++    if (mInputLayout->mMultiPlanar) {
++        for (size_t i = 0; i < planes.size(); ++i) {
++            buffer.setPlaneDataOffset(i, 0);
++            buffer.setPlaneBytesUsed(
++                    i, ::base::checked_cast<size_t>(
++                               getArea(planeSize(format, i, mInputLayout->mCodedSize)).value()));
++        }
++    } else {
++        buffer.setPlaneDataOffset(0, 0);
++        buffer.setPlaneBytesUsed(0, allocationSize(format, mInputLayout->mCodedSize));
++    }
++    return true;
++}
++
+ bool V4L2Encoder::enqueueOutputBuffer() {
+     ALOGV("%s()", __func__);
+     ALOG_ASSERT(mTaskRunner->RunsTasksInCurrentSequence());
+@@ -841,10 +926,17 @@
+ 
+     size_t bufferId = buffer->bufferId();
+ 
+-    std::vector<int> fds;
+-    fds.push_back(bitstreamBuffer->dmabuf->handle()->data[0]);
+-    if (!std::move(*buffer).queueDMABuf(fds)) {
+-        ALOGE("Failed to queue output buffer using QueueDMABuf");
++    // mothershipOS: the device writes into its MMAP buffer; dequeueOutputBuffer copies into the block
++    bool queued;
++    if (mMmap) {
++        queued = std::move(*buffer).queueMMap();
++    } else {
++        std::vector<int> fds;
++        fds.push_back(bitstreamBuffer->dmabuf->handle()->data[0]);
++        queued = std::move(*buffer).queueDMABuf(fds);
++    }
++    if (!queued) {
++        ALOGE("Failed to queue output buffer");
+         onError();
+         return false;
+     }
+@@ -939,6 +1031,17 @@
+ 
+     std::unique_ptr<BitstreamBuffer> bitstreamBuffer =
+             std::move(mOutputBuffers[buffer->bufferId()]);
++    // mothershipOS: the encoded data from the device's MMAP buffer into the client's block
++    if (mMmap && encodedDataSize > 0) {
++        const uint8_t* src = static_cast<const uint8_t*>(buffer->getPlaneMapping(0));
++        C2WriteView view = bitstreamBuffer->dmabuf->map().get();
++        if (src == nullptr || view.error() != C2_OK || view.capacity() < encodedDataSize) {
++            ALOGE("%s(): cannot copy %zu encoded bytes", __func__, encodedDataSize);
++            onError();
++            return false;
++        }
++        memcpy(view.data(), src + buffer->getPlaneDataOffset(0), encodedDataSize);
++    }
+     if (encodedDataSize > 0) {
+         if (!mInjectParamsBeforeIDR) {
+             // No need to inject SPS or PPS before IDR frames, we can just return the buffer as-is.
+@@ -1013,7 +1116,9 @@
+ 
+     // No memory is allocated here, we just generate a list of buffers on the input queue, which
+     // will hold memory handles to the real buffers.
+-    if (mInputQueue->allocateBuffers(kInputBufferCount, V4L2_MEMORY_DMABUF) < kInputBufferCount) {
++    mMmap = property_get_bool("ro.vendor.v4l2_codec2.encoder_mmap", true);
++    if (mInputQueue->allocateBuffers(kInputBufferCount, mMmap ? V4L2_MEMORY_MMAP : V4L2_MEMORY_DMABUF) <
++        kInputBufferCount) {
+         ALOGE("Failed to create V4L2 input buffers.");
+         return false;
+     }
+@@ -1030,7 +1135,7 @@
+ 
+     // No memory is allocated here, we just generate a list of buffers on the output queue, which
+     // will hold memory handles to the real buffers.
+-    if (mOutputQueue->allocateBuffers(kOutputBufferCount, V4L2_MEMORY_DMABUF) <
++    if (mOutputQueue->allocateBuffers(kOutputBufferCount, mMmap ? V4L2_MEMORY_MMAP : V4L2_MEMORY_DMABUF) <
+         kOutputBufferCount) {
+         ALOGE("Failed to create V4L2 output buffers.");
+         return false;

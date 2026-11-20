@@ -1,0 +1,22 @@
+// GNSS (mship.gnss): the phone's receiver, owned by the mothershipOS host, as NMEA epochs on /dev/gnss0
+// (Cuttlefish's GNSS console, hvc6). Replaces Cuttlefish's mock HAL (custom_nio_vm.mk: LOCAL_GNSS_PRODUCT_PACKAGE).
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_binary {
+    name: "android.hardware.gnss-service.mship",
+    vendor: true,
+    relative_install_path: "hw",
+    cflags: ["-Wall", "-Wextra", "-Werror"],
+    srcs: ["Gnss.cpp", "Nmea.cpp", "service.cpp"],
+    shared_libs: [
+        "android.hardware.gnss-V6-ndk",
+        "libbase",
+        "libbinder_ndk",
+        "liblog",
+        "libutils",
+    ],
+    init_rc: ["android.hardware.gnss-service.mship.rc"],
+    vintf_fragments: ["android.hardware.gnss-service.mship.xml"],
+}

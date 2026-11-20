@@ -1,0 +1,75 @@
+mothershipOS: the external camera provider reports a device's torch changes (setTorchMode, patch 0006) to the camera
+service (torchModeStatusChange). Without it the service never learns the torch is on, and the flashlight tile
+only ever turns it on.
+
+diff -ru a/camera/device/default/ExternalCameraDevice.cpp b/camera/device/default/ExternalCameraDevice.cpp
+--- a/camera/device/default/ExternalCameraDevice.cpp	2026-11-19 22:08:17.405268031 +0000
++++ b/camera/device/default/ExternalCameraDevice.cpp	2026-11-19 22:08:17.428268663 +0000
+@@ -250,6 +250,7 @@
+     if (ioctl(fd.get(), VIDIOC_S_CTRL, &c) != 0) {
+         return fromStatus(Status::INTERNAL_ERROR);
+     }
++    if (mTorchCb) mTorchCb(on);
+     return fromStatus(Status::OK);
+ }
+ 
+diff -ru a/camera/device/default/ExternalCameraDevice.h b/camera/device/default/ExternalCameraDevice.h
+--- a/camera/device/default/ExternalCameraDevice.h	2026-11-19 22:08:17.397267811 +0000
++++ b/camera/device/default/ExternalCameraDevice.h	2026-11-19 22:08:17.428268663 +0000
+@@ -17,6 +17,7 @@
+ #ifndef HARDWARE_INTERFACES_CAMERA_DEVICE_DEFAULT_EXTERNALCAMERADEVICE_H_
+ #define HARDWARE_INTERFACES_CAMERA_DEVICE_DEFAULT_EXTERNALCAMERADEVICE_H_
+ 
++#include <functional>
+ #include <ExternalCameraDeviceSession.h>
+ #include <ExternalCameraUtils.h>
+ #include <aidl/android/hardware/camera/device/BnCameraDevice.h>
+@@ -58,6 +59,8 @@
+             const std::shared_ptr<ICameraDeviceCallback>& in_callback,
+             std::shared_ptr<ICameraInjectionSession>* _aidl_return) override;
+     ndk::ScopedAStatus setTorchMode(bool in_on) override;
++    // mothershipOS: told when the torch goes on or off (the provider reports it to the camera service)
++    void setTorchCallback(std::function<void(bool)> cb) { mTorchCb = std::move(cb); }
+     ndk::ScopedAStatus turnOnTorchWithStrengthLevel(int32_t in_torchStrength) override;
+     ndk::ScopedAStatus getTorchStrengthLevel(int32_t* _aidl_return) override;
+ 
+@@ -71,6 +74,7 @@
+     static std::string kDeviceVersion;
+ 
+   private:
++    std::function<void(bool)> mTorchCb;
+     virtual std::shared_ptr<ExternalCameraDeviceSession> createSession(
+             const std::shared_ptr<ICameraDeviceCallback>&, const ExternalCameraConfig& cfg,
+             const std::vector<SupportedV4L2Format>& sortedFormats, const CroppingType& croppingType,
+diff -ru a/camera/provider/default/ExternalCameraProvider.cpp b/camera/provider/default/ExternalCameraProvider.cpp
+--- a/camera/provider/default/ExternalCameraProvider.cpp	2026-11-19 22:08:17.412268224 +0000
++++ b/camera/provider/default/ExternalCameraProvider.cpp	2026-11-19 22:08:17.429268691 +0000
+@@ -21,6 +21,7 @@
+ 
+ #include <ExternalCameraDevice.h>
+ #include <aidl/android/hardware/camera/common/Status.h>
++#include <aidl/android/hardware/camera/common/TorchModeStatus.h>
+ #include <convert.h>
+ #include <cutils/properties.h>
+ #include <linux/videodev2.h>
+@@ -139,6 +140,20 @@
+         return fromStatus(Status::INTERNAL_ERROR);
+     }
+ 
++    // mothershipOS: the device's torch (setTorchMode) reported to the camera service, which otherwise never
++    // learns the torch is on (the flashlight tile would only ever turn it on)
++    {
++        std::shared_ptr<ICameraProviderCallback> cb = mCallback;
++        std::string name = in_cameraDeviceName;
++        deviceImpl->setTorchCallback([cb, name](bool on) {
++            using ::aidl::android::hardware::camera::common::TorchModeStatus;
++            if (cb != nullptr) {
++                cb->torchModeStatusChange(name, on ? TorchModeStatus::AVAILABLE_ON
++                                                   : TorchModeStatus::AVAILABLE_OFF);
++            }
++        });
++    }
++
+     IF_ALOGV() {
+         int interfaceVersion;
+         deviceImpl->getInterfaceVersion(&interfaceVersion);

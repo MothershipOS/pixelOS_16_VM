@@ -1,0 +1,5 @@
+# mothershipOS: the external camera HAL converts frames on the GPU (patches/hardware/interfaces/0008):
+# the virtio-gpu render node and the GPU's graphics properties
+allow hal_camera_default gpu_device:chr_file rw_file_perms;
+allow hal_camera_default gpu_device:dir r_dir_perms;
+get_prop(hal_camera_default, graphics_config_prop)

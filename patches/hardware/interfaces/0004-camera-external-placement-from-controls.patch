@@ -1,0 +1,44 @@
+mothershipOS: the external camera HAL takes each camera's facing and sensor orientation from the device's standard
+camera controls (V4L2_CID_CAMERA_ORIENTATION, V4L2_CID_CAMERA_SENSOR_ROTATION), which a mothershipOS host sets per
+camera (mship.camera). Without it every camera is "external" (shown as front) with one configured orientation.
+
+diff -ru a/camera/device/default/ExternalCameraDevice.cpp b/camera/device/default/ExternalCameraDevice.cpp
+--- a/camera/device/default/ExternalCameraDevice.cpp	2026-11-19 18:05:07.396206727 +0000
++++ b/camera/device/default/ExternalCameraDevice.cpp	2026-11-19 18:05:07.411207121 +0000
+@@ -35,6 +35,27 @@
+ using ::aidl::android::hardware::camera::common::Status;
+ 
+ namespace {
++// mothershipOS: which way the camera faces and how its sensor is mounted, from the device's standard camera
++// controls (V4L2_CID_CAMERA_ORIENTATION, V4L2_CID_CAMERA_SENSOR_ROTATION; a mothershipOS host sets them per camera).
++// A device without them stays an external camera with the configured orientation.
++void updatePlacement(int fd, ::android::hardware::camera::common::V1_0::helper::CameraMetadata* metadata) {
++    v4l2_control c{.id = V4L2_CID_CAMERA_ORIENTATION};
++    if (ioctl(fd, VIDIOC_G_CTRL, &c) != 0) return;
++    uint8_t facing;
++    switch (c.value) {
++        case V4L2_CAMERA_ORIENTATION_FRONT: facing = ANDROID_LENS_FACING_FRONT; break;
++        case V4L2_CAMERA_ORIENTATION_BACK: facing = ANDROID_LENS_FACING_BACK; break;
++        default: return;
++    }
++    metadata->update(ANDROID_LENS_FACING, &facing, 1);
++    c = {.id = V4L2_CID_CAMERA_SENSOR_ROTATION};
++    if (ioctl(fd, VIDIOC_G_CTRL, &c) == 0) {
++        const int32_t orientation = c.value;
++        metadata->update(ANDROID_SENSOR_ORIENTATION, &orientation, 1);
++    }
++    ALOGI("%s: facing %s, orientation %d", __FUNCTION__, facing == ANDROID_LENS_FACING_FRONT ? "front" : "back", c.value);
++}
++
+ // Only support MJPEG for now as it seems to be the one supports higher fps
+ // Other formats to consider in the future:
+ // * V4L2_PIX_FMT_YVU420 (== YV12)
+@@ -299,6 +320,8 @@
+         return ret;
+     }
+ 
++    updatePlacement(fd.get(), &mCameraCharacteristics);
++
+     ret = initAvailableCapabilities(&mCameraCharacteristics);
+     if (ret != OK) {
+         ALOGE("%s: init available capabilities key failed: errorno %d", __FUNCTION__, ret);

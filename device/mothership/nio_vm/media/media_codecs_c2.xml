@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8" ?>
 <!--
-  mship.video: the host's Venus decoder (SM7250) as V4L2 Codec2 components (android.hardware.media.c2-service.mship-v4l2).
-  Rank 0x80 (v4l2_codec2): ahead of the software components (0x200). Limits: Venus decodes VP9 4K at ~33-40 fps.
+  mship.video: the host's Venus decoder and encoder (SM7250) as V4L2 Codec2 components
+  (android.hardware.media.c2-service.mship-v4l2). Rank 0x80 (v4l2_codec2): ahead of the software components (0x200).
+  Limits: Venus decodes VP9 4K at ~33-40 fps; it encodes 1080p H.264 at ~190 fps; it has no VP9 encoder.
 -->
 <MediaCodecs>
     <Decoders>
@@ -49,4 +50,26 @@
             <Feature name="adaptive-playback" />
         </MediaCodec>
     </Decoders>
+    <Encoders>
+        <MediaCodec name="c2.v4l2.avc.encoder" type="video/avc">
+            <Limit name="size" min="96x96" max="4096x2304" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="blocks-per-second" min="1" max="1036800" />
+            <Limit name="bitrate" range="1-100000000" />
+            <Limit name="concurrent-instances" max="4" />
+            <Limit name="performance-point-3840x2160" range="30-30" />
+            <Limit name="performance-point-1920x1080" range="60-60" />
+            <Feature name="bitrate-modes" value="VBR,CBR" />
+        </MediaCodec>
+        <MediaCodec name="c2.v4l2.vp8.encoder" type="video/x-vnd.on2.vp8">
+            <Limit name="size" min="96x96" max="1920x1088" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="blocks-per-second" min="1" max="489600" />
+            <Limit name="bitrate" range="1-40000000" />
+            <Limit name="concurrent-instances" max="4" />
+            <Limit name="performance-point-1920x1080" range="30-30" />
+        </MediaCodec>
+    </Encoders>
 </MediaCodecs>

@@ -1,0 +1,104 @@
+From: mothershipOS
+Subject: [PATCH] sensors: the host streams only the active sensors
+
+The goldfish multi-HAL enables every sensor on the host once (set:<name>:1 for the whole mask) and filters
+activation inside the guest; the update interval only follows batch(). On the emulator that is free; with
+mothershipOS the host is a phone whose sensor DSP then streams accelerometer, gyroscope and magnetometer at the
+fastest rate ever asked for, the whole time the VM runs. Now activate() forwards set:<name>:<0|1> (the protocol
+has it), the listener enables only the active sensors when it (re)connects, and the interval is recomputed from
+the active streaming sensors on activation changes too (an on-change sensor's period does not count).
+
+diff --git a/hals/sensors/include/multihal_sensors.h b/hals/sensors/include/multihal_sensors.h
+--- a/hals/sensors/include/multihal_sensors.h
++++ b/hals/sensors/include/multihal_sensors.h
+@@ -106,6 +106,8 @@
+                                        uint32_t availableSensorsMask, bool enabled);
+     static bool setSensorsGuestTime(SensorsTransport& st, int64_t value);
+     static bool setSensorsUpdateIntervalMs(SensorsTransport& st, uint32_t value);
++    // m_protocolState.sensorsUpdateIntervalMs from the active sensors, sent to the host (with m_mtx held)
++    void updateSensorsUpdateIntervalLocked();
+     void parseQemuSensorEventLocked(QemuSensorsProtocolState* state);
+     void postSensorEventLocked(const Event& event);
+     void doPostSensorEventLocked(const SensorInfo& sensor, const Event& event);
+diff --git a/hals/sensors/multihal_sensors.cpp b/hals/sensors/multihal_sensors.cpp
+--- a/hals/sensors/multihal_sensors.cpp
++++ b/hals/sensors/multihal_sensors.cpp
+@@ -173,9 +173,36 @@
+     } else {
+         m_activeSensorsMask = m_activeSensorsMask & ~(1u << sensorHandle);
+     }
++    // the host streams only what is active, at the rate the active sensors need (a phone's sensors cost power;
++    // a stub transport before the listener thread connects: it sends the active set when it does)
++    setSensorsReportingImpl(*m_sensorsTransport, sensorHandle, enabled);
++    updateSensorsUpdateIntervalLocked();
+     return Result::OK;
+ }
+ 
++void MultihalSensors::updateSensorsUpdateIntervalLocked() {
++    // streaming sensors only: an on-change sensor's sampling period does not set the host's interval
++    auto minSamplingPeriodNs = kMaxSamplingPeriodNs;
++    for (int h = 0; h < int(m_batchInfo.size()); ++h) {
++        const SensorInfo* sensor = getSensorInfoByHandle(h);
++        if ((m_activeSensorsMask & (1u << h)) && sensor && isContiniousReportingSensor(sensor->flags)) {
++            const auto periodNs = m_batchInfo[h].samplingPeriodNs;
++            if ((periodNs > 0) && (periodNs < minSamplingPeriodNs)) {
++                minSamplingPeriodNs = periodNs;
++            }
++        }
++    }
++
++    const uint32_t sensorsUpdateIntervalMs = std::max(1, int(minSamplingPeriodNs / 1000000));
++    if (sensorsUpdateIntervalMs == m_protocolState.sensorsUpdateIntervalMs) {
++        return;
++    }
++    m_protocolState.sensorsUpdateIntervalMs = sensorsUpdateIntervalMs;
++    if (!setSensorsUpdateIntervalMs(*m_sensorsTransport, sensorsUpdateIntervalMs)) {
++        qemuSensorThreadSendCommand(kCMD_RESTART);
++    }
++}
++
+ Event MultihalSensors::activationOnChangeSensorEvent(const int32_t sensorHandle,
+                                                      const SensorInfo& sensor) const {
+     Event event;
+@@ -262,25 +289,7 @@
+     std::unique_lock<std::mutex> lock(m_mtx);
+     if (m_opMode == OperationMode::NORMAL) {
+         m_batchInfo[sensorHandle].samplingPeriodNs = samplingPeriodNs;
+-
+-        auto minSamplingPeriodNs = kMaxSamplingPeriodNs;
+-        auto activeSensorsMask = m_activeSensorsMask;
+-        for (const auto& b : m_batchInfo) {
+-            if (activeSensorsMask & 1) {
+-                const auto periodNs = b.samplingPeriodNs;
+-                if ((periodNs > 0) && (periodNs < minSamplingPeriodNs)) {
+-                    minSamplingPeriodNs = periodNs;
+-                }
+-            }
+-
+-            activeSensorsMask >>= 1;
+-        }
+-
+-        const uint32_t sensorsUpdateIntervalMs = std::max(1, int(minSamplingPeriodNs / 1000000));
+-        m_protocolState.sensorsUpdateIntervalMs = sensorsUpdateIntervalMs;
+-        if (!setSensorsUpdateIntervalMs(*m_sensorsTransport, sensorsUpdateIntervalMs)) {
+-            qemuSensorThreadSendCommand(kCMD_RESTART);
+-        }
++        updateSensorsUpdateIntervalLocked();
+     }
+ 
+     return Result::OK;
+@@ -429,8 +438,13 @@
+             *st, ::android::elapsedRealtimeNano()));
+         LOG_ALWAYS_FATAL_IF(!setSensorsUpdateIntervalMs(
+             *st, m_protocolState.sensorsUpdateIntervalMs));
++        uint32_t activeSensorsMask;
++        {
++            std::unique_lock<std::mutex> lock(m_mtx);
++            activeSensorsMask = m_activeSensorsMask;
++        }
+         LOG_ALWAYS_FATAL_IF(!setAllSensorsReporting(
+-            *st, m_availableSensorsMask, true));
++            *st, m_availableSensorsMask & activeSensorsMask, true));
+ 
+         {
+             std::unique_lock<std::mutex> lock(m_mtx);
