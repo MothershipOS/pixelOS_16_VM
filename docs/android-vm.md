@@ -59,6 +59,10 @@ Host: mothershipOS, user `mship`, sway session. VM dir on the phone: `/var/lib/m
   dmabufs that the panel scans out zero-copy. The gfxstream fallback (~35-45 fps scrolling, ~12 ms/frame
   composition) is `MSHIP_VM_GPU=gfxstream`.
 - Touch, volume keys, power key: Android's own while lent.
+- Brightness: `patches/device/google/cuttlefish/0006`: Cuttlefish's lights HAL also has a backlight (without one
+  Android's brightness does nothing), and `patches/frameworks/base/0001` sends it at 16 bits instead of 8 (8 bits
+  made visible steps at low brightness); mothershipd applies it to the panel while PixelOS has the display
+  (`contracts/mship.display-power-1.md`).
 - Wi-Fi: native, per band (`mship.wifi`, items Wi-Fi 2.4 GHz / 5 GHz), or shared internet (NAT, item
   `internet`). See "Wi-Fi" below.
 - Telephony: Cuttlefish's stock RIL against the phone's modem (`mship.modem`, item `cellular`). See
@@ -114,7 +118,7 @@ Host: mothershipOS, user `mship`, sway session. VM dir on the phone: `/var/lib/m
   HAL instead of Cuttlefish's fixed one), see `contracts/mship.battery-1.md`.
 - USB: devices plugged into the phone, passed to the guest's xHCI (`mship.usb`, hardware item `usb`); USB disks
   mount through vold (fstab patch). See `contracts/mship.usb-1.md`.
-- Audio (`mship.audio`, items Speaker, Earpiece, Headset, Microphones in Settings › Hardware): the guest's
+- Audio (`mship.audio`, items Speaker, Earpiece, Headset, Microphones in a VM's page › Hardware): the guest's
   virtio-snd card has one PCM per phone device (0 speaker, 1 earpiece, 2 wired headset, 3 main mic, 4 back mic,
   5 headset mic) and the headset jack (input switches). The stock AIDL HAL and Cuttlefish's policy list these
   devices (`patches/hardware/interfaces/0002`, `patches/device/google/cuttlefish/0004`; the HAL picks the PCM by

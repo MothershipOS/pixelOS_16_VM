@@ -1,0 +1,28 @@
+mothershipOS (display): the backlight goes to the lights HAL at 16 bits (colour = 0x01000000 | level, level =
+brightness x 65535): the 8-bit value made visible steps at low brightness. The host's lights client reads both
+forms (mship.display-power).
+
+diff -ruN a/services/core/java/com/android/server/lights/LightsService.java b/services/core/java/com/android/server/lights/LightsService.java
+--- a/services/core/java/com/android/server/lights/LightsService.java	2026-11-20 18:07:51.645792399 +0000
++++ b/services/core/java/com/android/server/lights/LightsService.java	2026-11-20 18:07:51.667793001 +0000
+@@ -311,9 +311,17 @@
+                             + ": brightness=" + brightness);
+                     return;
+                 }
+-                int brightnessInt = BrightnessSynchronizer.brightnessFloatToInt(brightness);
+-                int color = brightnessInt & 0x000000ff;
+-                color = 0xff000000 | (color << 16) | (color << 8) | color;
++                int color;
++                if (mHwLight.type == LightsManager.LIGHT_ID_BACKLIGHT) {
++                    // mothershipOS: the backlight at 16 bits (alpha 0x01 marks it; the host's lights client
++                    // reads it): 8 bits make visible steps at low brightness
++                    int level = brightness <= 0f ? 0 : Math.min(65535, Math.round(brightness * 65535f));
++                    color = 0x01000000 | level;
++                } else {
++                    int brightnessInt = BrightnessSynchronizer.brightnessFloatToInt(brightness);
++                    color = brightnessInt & 0x000000ff;
++                    color = 0xff000000 | (color << 16) | (color << 8) | color;
++                }
+                 setLightLocked(color, LIGHT_FLASH_NONE, 0, 0, brightnessMode);
+             }
+         }

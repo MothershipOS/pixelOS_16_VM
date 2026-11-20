@@ -1,0 +1,19 @@
+mothershipOS (display): the lights HAL also has the screen's backlight. Android has no backlight otherwise
+(DisplayManager: backlight=null) and its brightness does nothing; the host applies the backlight's state (Cuttlefish's
+lights protocol over vsock, port 6900) to the panel while this VM holds the display.
+
+diff -ruN a/guest/hals/light/lights.rs b/guest/hals/light/lights.rs
+--- a/guest/hals/light/lights.rs	2026-11-20 16:23:45.272008354 +0000
++++ b/guest/hals/light/lights.rs	2026-11-20 16:23:45.297009019 +0000
+@@ -74,7 +74,10 @@
+         let id_mapping_closure =
+             |light_id| HwLight { id: light_id, ordinal: light_id, r#type: LightType::BATTERY };
+ 
+-        Self::new((1..=NUM_DEFAULT_LIGHTS).map(id_mapping_closure))
++        // mothershipOS: also the screen's backlight (the host applies it to the panel while this VM has the
++        // display); without one Android's brightness has no effect
++        let backlight = HwLight { id: NUM_DEFAULT_LIGHTS + 1, ordinal: 0, r#type: LightType::BACKLIGHT };
++        Self::new((1..=NUM_DEFAULT_LIGHTS).map(id_mapping_closure).chain(std::iter::once(backlight)))
+     }
+ }
+ 
