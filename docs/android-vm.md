@@ -308,15 +308,15 @@ app MediaCodec --AIDL Codec2--> c2.v4l2.* (vendor.media.c2-v4l2, mediacodec doma
 
 ## Wi-Fi (native, mship.wifi)
 - `mship_wifi.ko` in `pkg/` makes `cargo xtask android-initrd` add it to the first-stage ramdisk and set
-  `androidboot.wifi_impl=mship_wifi` (no virt_wifi). It creates `wlan0` on the 4th NIC (`pxwltap0`,
-  MAC 02:6d:73:00:00:03). Android's own Wi-Fi stack drives the host's station interface of the lent band
+  `androidboot.wifi_impl=mship_wifi` (no virt_wifi). It creates `wlan0` on the 4th card (tap `vm3n3`,
+  MAC 02:6d:73:03:00:03 for CID 3). Android's own Wi-Fi stack drives the host's station interface of the lent band
   (`mshw2g` or `mshw5g`) through `mship-wifi-bridge` (vsock 7710); one band per VM at a time. Details and gaps: `contracts/mship.wifi-1.md`.
 - Android prefers a validated Ethernet over Wi-Fi: don't lend shared internet to a VM that uses native Wi-Fi.
 - Bridge control: `attach 3 2g` / `detach 3 user` / `status` on `/run/mothership/wifi-bridge.sock`.
 
 ## Wi-Fi (shared internet)
-- `mship-vm-net.service` (boot, `mship-system net`): taps pxmtap0/pxetap0/pxwtap0/pxwltap0, dnsmasq DHCP,
-  iptables-legacy chains `MSHIP_VM` closed (DROP). Without native Wi-Fi the guest's eth2 becomes virt_wifi
+- Four network cards (taps `vm<cid>n<i>`: mobile data, ethernet, Wi-Fi, native Wi-Fi), blank until their handle is
+  attached; mothershipd makes them when the VM starts and removes them when it stops. Without native Wi-Fi the guest's eth2 becomes virt_wifi
   `wlan0` ("VirtWifi").
-- Item `internet`: mothershipd NATs pxwtap0 out of the host's uplink while the VM runs; taking it back or stopping
-  the VM closes it again. Screen switches don't move it.
+- Item `internet` (mship-net): while the VM holds it, its Wi-Fi card (eth2) gets 10.200.<cid>.2 by DHCP and NAT out
+  of the phone's uplink; taking it back or stopping the VM leaves the card blank again. Screen switches don't move it.
